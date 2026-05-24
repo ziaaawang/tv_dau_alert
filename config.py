@@ -18,7 +18,7 @@ ADHOC_TOKEN = "adhoc_vyF9pF4nE94P73EoJWbqbLVXiINsWB"  # ← 填入你的 token
 
 # 千问API（对话功能）
 LLM_BASE_URL = "http://llmapi.bilibili.co/v1"
-LLM_TOKEN = "bsk-b065d60f6294c2f9078a70851c840d8d"
+LLM_TOKEN = "bsk-8605fd60009e14d1abba03514fc86d2d"
 LLM_MODEL = "qwen3.5-plus"
 
 # 预估默认参数

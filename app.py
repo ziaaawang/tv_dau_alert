@@ -1317,7 +1317,8 @@ GROUP BY 1
 
 
 def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14, yoy_overrides=None,
-                           manual_weekday_yoy=None, manual_weekend_yoy=None):
+                           manual_weekday_yoy=None, manual_weekend_yoy=None,
+                           weekday_slope=0.0, weekend_slope=0.0):
     """天级DAU预估
     df_26: 26年已有历史(log_date, dau)
     df_25: 25年参考数据(log_date, dau)
@@ -1345,6 +1346,8 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
             d = datetime.strptime(d, '%Y%m%d').date()
         dau_26[d] = float(row['dau'])
 
+    last_hist_date = max(dau_26.keys()) if dau_26 else (forecast_dates[0] if forecast_dates else date.today())
+
     # 计算历史日期的YoY
     hist_dates = sorted(dau_26.keys())
     hist_records = []
@@ -1356,7 +1359,7 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
         hist_records.append({
             '日期': d26, '26年DAU': dau_actual, '数据类型': '实际',
             '25年参考日期': d25, '25年参考DAU': dau_ref, 'YoY%': yoy,
-            'is_weekend': _is_weekend(d26),
+            'is_weekend': _is_weekend(d26) or bool(_get_holiday_info(d26, d26.year)),
         })
 
     # 计算近N天的 weekday/weekend 平均YoY
@@ -1378,7 +1381,7 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
     for d26 in sorted(forecast_dates):
         d25 = align_map.get(d26)
         dau_ref = dau_25.get(d25, 0) if d25 else 0
-        is_wknd = _is_weekend(d26)
+        is_wknd = _is_weekend(d26) or bool(_get_holiday_info(d26, d26.year))
 
         # 检查是否有手动覆盖
         override_hit = None
@@ -1392,7 +1395,10 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
             yoy_rate = override_hit['yoy']
             data_type = '预估(调整)'
         else:
-            yoy_rate = weekend_avg_yoy if is_wknd else weekday_avg_yoy
+            base_yoy = weekend_avg_yoy if is_wknd else weekday_avg_yoy
+            slope = weekend_slope if is_wknd else weekday_slope
+            weeks_ahead = max(0, (d26 - last_hist_date).days) / 7
+            yoy_rate = base_yoy + slope * weeks_ahead
             data_type = '预估'
 
         predicted = round(dau_ref * (1 + yoy_rate / 100)) if dau_ref > 0 else 0
@@ -1405,6 +1411,64 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
     all_records = hist_records + forecast_records
     result_df = pd.DataFrame(all_records)
     return result_df, weekday_avg_yoy, weekend_avg_yoy
+
+
+def compute_weekly_yoy_stats(df_26, df_25, align_map, ref_weeks=4):
+    """计算每周平均YoY的趋势斜率（分weekday/weekend），返回 (wd_slope, we_slope) 单位pp/周
+    ref_weeks: 使用最近N周数据计算斜率
+    """
+    from calendar_config import _is_weekend
+    from collections import defaultdict
+
+    dau_25 = {}
+    for _, row in df_25.iterrows():
+        d = row['log_date']
+        if isinstance(d, str):
+            d = datetime.strptime(d, '%Y%m%d').date()
+        dau_25[d] = float(row['dau'])
+
+    dau_26 = {}
+    for _, row in df_26.iterrows():
+        d = row['log_date']
+        if isinstance(d, str):
+            d = datetime.strptime(d, '%Y%m%d').date()
+        dau_26[d] = float(row['dau'])
+
+    weekly_wd = defaultdict(list)
+    weekly_we = defaultdict(list)
+
+    for d26 in sorted(dau_26.keys()):
+        d25 = align_map.get(d26)
+        if not d25 or d25 not in dau_25 or dau_25[d25] == 0:
+            continue
+        yoy = (dau_26[d26] / dau_25[d25] - 1) * 100
+        key = (d26.isocalendar()[0], d26.isocalendar()[1])
+        if _is_weekend(d26):
+            weekly_we[key].append(yoy)
+        else:
+            weekly_wd[key].append(yoy)
+
+    sorted_weeks = sorted(set(list(weekly_wd.keys()) + list(weekly_we.keys())))
+    if ref_weeks and len(sorted_weeks) > ref_weeks:
+        sorted_weeks = sorted_weeks[-ref_weeks:]
+
+    def _build_series(weekly_dict):
+        series = []
+        for i, key in enumerate(sorted_weeks):
+            vals = weekly_dict.get(key)
+            if vals:
+                series.append((i, sum(vals) / len(vals)))
+        return series
+
+    def _slope(series):
+        if len(series) < 3:
+            return 0.0
+        x = np.array([s[0] for s in series])
+        y = np.array([s[1] for s in series])
+        coeffs = np.polyfit(x, y, 1)
+        return round(coeffs[0], 2)
+
+    return _slope(_build_series(weekly_wd)), _slope(_build_series(weekly_we))
 
 
 def _render_short_term_forecast():
@@ -1508,6 +1572,8 @@ def _render_short_term_forecast():
                 'hist_start': hist_start, 'hist_end': hist_end,
                 'fc_start': fc_start, 'fc_end': fc_end, 'ref_days': ref_days,
             }
+            st.session_state.pop('fc_wd_slope', None)
+            st.session_state.pop('fc_we_slope', None)
             status = st.empty()
             sql_26 = build_daily_dau_sql(hist_start_s, hist_end_s)
             sql_25 = build_daily_dau_sql(ref_min_s, ref_max_s)
@@ -1547,10 +1613,32 @@ def _render_short_term_forecast():
     # 预测日期列表
     forecast_dates = [fc_start + timedelta(days=i) for i in range((fc_end - fc_start).days + 1)]
 
+    # 计算YoY周环比趋势
+    with st.expander("📈 YoY周环比趋势调整", expanded=False):
+        enable_slope = st.checkbox("启用趋势调整（逐周递增/递减预测YoY）",
+                                   value=False, key="fc_enable_slope")
+        if enable_slope:
+            slope_ref_weeks = st.slider("趋势参考周数", 3, 12, value=4, key="fc_slope_ref_weeks",
+                                        help="用最近N周的YoY趋势计算斜率")
+            wd_slope_auto, we_slope_auto = compute_weekly_yoy_stats(
+                df_26, df_25, align_map, ref_weeks=slope_ref_weeks)
+            st.caption(f"自动计算（最近{slope_ref_weeks}周）: 周中 {wd_slope_auto:+.2f}pp/周, 周末 {we_slope_auto:+.2f}pp/周")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                wd_slope = st.number_input("周中斜率(pp/周)", value=round(wd_slope_auto, 2),
+                                           step=0.1, format="%.2f", key="fc_wd_slope")
+            with sc2:
+                we_slope = st.number_input("周末斜率(pp/周)", value=round(we_slope_auto, 2),
+                                           step=0.1, format="%.2f", key="fc_we_slope")
+        else:
+            wd_slope = 0.0
+            we_slope = 0.0
+
     # 计算
     result_df, weekday_yoy, weekend_yoy = compute_daily_forecast(
         df_26, df_25, align_map, forecast_dates, ref_days,
-        yoy_overrides=st.session_state.get('fc_yoy_overrides'))
+        yoy_overrides=st.session_state.get('fc_yoy_overrides'),
+        weekday_slope=wd_slope, weekend_slope=we_slope)
 
     # 添加25年周对齐DAU
     dau_25_lookup = {}
@@ -1568,8 +1656,10 @@ def _render_short_term_forecast():
     st.markdown("#### AI预估结果")
 
     m1, m2 = st.columns(2)
-    m1.metric("周中平均YoY", f"{weekday_yoy:+.1f}%")
-    m2.metric("周末平均YoY", f"{weekend_yoy:+.1f}%")
+    wd_delta = f"{wd_slope:+.2f}pp/周" if wd_slope != 0 else None
+    we_delta = f"{we_slope:+.2f}pp/周" if we_slope != 0 else None
+    m1.metric("周中平均YoY", f"{weekday_yoy:+.1f}%", delta=wd_delta)
+    m2.metric("周末平均YoY", f"{weekend_yoy:+.1f}%", delta=we_delta)
 
     # 趋势图
     hist_part = result_df[result_df['数据类型'] == '实际'].copy()
@@ -1663,7 +1753,8 @@ def _render_short_term_forecast():
     manual_result_df, _, _ = compute_daily_forecast(
         df_26, df_25, align_map, forecast_dates, ref_days,
         yoy_overrides=st.session_state.get('fc_yoy_overrides'),
-        manual_weekday_yoy=manual_wd_yoy, manual_weekend_yoy=manual_we_yoy)
+        manual_weekday_yoy=manual_wd_yoy, manual_weekend_yoy=manual_we_yoy,
+        weekday_slope=wd_slope, weekend_slope=we_slope)
     manual_result_df['25年周对齐日期'] = manual_result_df['日期'].map(week_align_map)
     manual_result_df['25年周对齐DAU'] = manual_result_df['25年周对齐日期'].map(
         lambda d: dau_25_lookup.get(d, 0) if d else 0)
