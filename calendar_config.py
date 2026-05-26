@@ -8,6 +8,15 @@ from datetime import date, timedelta, datetime
 # 节假日（放假区间，含调休连休）
 # ═══════════════════════════════════════════
 HOLIDAYS = {
+    2024: {
+        '元旦':     ('20240101', '20240101'),
+        '春节':     ('20240209', '20240217'),
+        '清明':     ('20240404', '20240406'),
+        '劳动节':   ('20240501', '20240505'),
+        '端午':     ('20240608', '20240610'),
+        '中秋':     ('20240915', '20240917'),
+        '国庆':     ('20241001', '20241007'),
+    },
     2025: {
         '元旦':     ('20250101', '20250101'),
         '春节':     ('20250128', '20250204'),
@@ -31,6 +40,7 @@ HOLIDAYS = {
 # 调休上班日（原本是休息日，调为工作日）
 # ═══════════════════════════════════════════
 TRANSFER_WORK = {
+    2024: {'20240204', '20240218', '20240407', '20240428', '20240511', '20240914', '20240929', '20241012'},
     2025: {'20250126', '20250208', '20250427', '20250928', '20251011'},
     2026: {'20260104', '20260214', '20260228', '20260509', '20260920', '20261010'},
 }
@@ -39,11 +49,13 @@ TRANSFER_WORK = {
 # 寒暑假
 # ═══════════════════════════════════════════
 WINTER_BREAK = {
+    2024: ('20240120', '20240225'),
     2025: ('20250111', '20250216'),
     2026: ('20260117', '20260307'),
 }
 
 SUMMER_BREAK = {
+    2024: ('20240701', '20240831'),
     2025: ('20250701', '20250831'),
     2026: ('20260701', '20260831'),
 }
@@ -52,6 +64,39 @@ SUMMER_BREAK = {
 # 春节农历标注
 # ═══════════════════════════════════════════
 SPRING_FESTIVAL_LUNAR = {
+    2024: {
+        '20240125': '腊月十四',
+        '20240126': '腊月十五',
+        '20240127': '腊月十六',
+        '20240128': '腊月十七',
+        '20240129': '腊月十八',
+        '20240130': '腊月十九',
+        '20240131': '腊月二十',
+        '20240201': '腊月廿一',
+        '20240202': '腊月廿二',
+        '20240203': '腊月廿三',
+        '20240204': '腊月廿四',
+        '20240205': '腊月廿五',
+        '20240206': '腊月廿六',
+        '20240207': '腊月廿七',
+        '20240208': '腊月廿八',
+        '20240209': '除夕',
+        '20240210': '初一',
+        '20240211': '初二',
+        '20240212': '初三',
+        '20240213': '初四',
+        '20240214': '初五',
+        '20240215': '初六',
+        '20240216': '初七',
+        '20240217': '初八',
+        '20240218': '初九',
+        '20240219': '初十',
+        '20240220': '十一',
+        '20240221': '十二',
+        '20240222': '十三',
+        '20240223': '十四',
+        '20240224': '十五',
+    },
     2025: {
         # 除夕前15天（腊月十四~廿九）
         '20250113': '腊月十四',
@@ -308,181 +353,179 @@ def _find_nearest_normal_same_dow(d, year, max_weeks=4):
     return d
 
 
-def align_date(d26):
-    """将2026年的日期对齐到2025年的同性质日期。
+def align_date(d):
+    """将某年日期对齐到前一年的同性质日期。自动检测年份。
     优先级：农历对齐 > 节假日 > 寒暑假 > work stretch position 匹配
     """
+    year = d.year
+    ref_year = year - 1
+
     # P0: 春节前后农历对齐（除夕±15天，按农历标注匹配）
-    lunar_label = _get_lunar_label(d26, 2026)
+    lunar_label = _get_lunar_label(d, year)
     if lunar_label:
-        labels_25 = SPRING_FESTIVAL_LUNAR.get(2025, {})
-        for ds, lbl in labels_25.items():
+        labels_ref = SPRING_FESTIVAL_LUNAR.get(ref_year, {})
+        for ds, lbl in labels_ref.items():
             if lbl == lunar_label:
                 return _parse(ds)
 
     # P1: 节假日对齐（同名节假日内按 offset）
-    hol_info = _get_holiday_info(d26, 2026)
+    hol_info = _get_holiday_info(d, year)
     if hol_info:
         name, offset = hol_info
-        ref_holidays = HOLIDAYS.get(2025, {})
-        # 名称匹配：精确 → 子串模糊
+        ref_holidays = HOLIDAYS.get(ref_year, {})
         ref_name = None
         if name in ref_holidays:
             ref_name = name
         else:
+            candidates = []
             for rn in ref_holidays:
                 if name in rn or rn in name:
-                    ref_name = rn
-                    break
+                    candidates.append(rn)
+            if len(candidates) == 1:
+                ref_name = candidates[0]
+            elif len(candidates) > 1:
+                ref_name = min(candidates, key=lambda rn: abs(_parse(ref_holidays[rn][0]).month - d.month))
         if ref_name:
             ref_start = _parse(ref_holidays[ref_name][0])
             ref_end = _parse(ref_holidays[ref_name][1])
-            # 国庆单独拆分时，从参考假期末尾倒推对齐
-            if name == '国庆' and name != ref_name:
-                ref_len = (ref_end - ref_start).days
-                hol_len = (_parse(HOLIDAYS[2026][name][1]) - _parse(HOLIDAYS[2026][name][0])).days
-                candidate = ref_end - timedelta(days=hol_len - offset)
-            else:
-                candidate = ref_start + timedelta(days=offset)
+            candidate = ref_start + timedelta(days=offset)
             if candidate > ref_end:
                 return ref_end
             if candidate < ref_start:
                 return ref_start
             return candidate
-        return _iso_week_align(d26)
+        return _iso_week_align(d)
 
     # P2: 寒暑假对齐
-    break_type = _in_break(d26, 2026)
+    break_type = _in_break(d, year)
     if break_type:
-        return _break_align(d26, break_type)
+        return _break_align(d, break_type, year, ref_year)
 
     # P3: 按 work stretch position 对齐
-    iso_candidate = _iso_week_align(d26)
+    iso_candidate = _iso_week_align(d)
     candidate = iso_candidate
-    is_workday_26 = _is_actual_workday(d26, 2026)
+    is_workday_cur = _is_actual_workday(d, year)
 
-    if is_workday_26:
-        pos26 = _work_stretch_position(d26, 2026)
-        pos25 = _work_stretch_position(candidate, 2025)
-        if not _positions_match(pos26, pos25):
-            candidate = _find_position_match(candidate, pos26, 2025, is_workday=True)
+    if is_workday_cur:
+        pos_cur = _work_stretch_position(d, year)
+        pos_ref = _work_stretch_position(candidate, ref_year)
+        if not _positions_match(pos_cur, pos_ref):
+            candidate = _find_position_match(candidate, pos_cur, ref_year, is_workday=True)
     else:
-        pos26 = _rest_stretch_position(d26, 2026)
-        pos25 = _rest_stretch_position(candidate, 2025)
-        if pos25 is None or pos26[0] != pos25[0]:
-            candidate = _find_position_match(candidate, pos26, 2025, is_workday=False)
+        pos_cur = _rest_stretch_position(d, year)
+        pos_ref = _rest_stretch_position(candidate, ref_year)
+        if pos_ref is None or pos_cur[0] != pos_ref[0]:
+            candidate = _find_position_match(candidate, pos_cur, ref_year, is_workday=False)
 
-    # P4: 26年普通日不应对齐到25年节假日影响日（假日/调休/假期前最后工作日）
-    if _is_holiday_affected(candidate, 2025) and not _is_holiday_affected(d26, 2026):
-        candidate = _find_nearest_normal_same_dow(iso_candidate, 2025)
+    # P4: 当年普通日不应对齐到参考年节假日影响日
+    if _is_holiday_affected(candidate, ref_year) and not _is_holiday_affected(d, year):
+        candidate = _find_nearest_normal_same_dow(iso_candidate, ref_year)
 
     return candidate
 
 
-def _iso_week_align(d26):
-    """用ISO周+星期几找25年对应日期"""
-    iso = d26.isocalendar()
+def _iso_week_align(d):
+    """用ISO周+星期几找前一年对应日期"""
+    iso = d.isocalendar()
     iso_year, iso_week, iso_day = iso[0], iso[1], iso[2]
     try:
         return date.fromisocalendar(iso_year - 1, iso_week, iso_day)
     except ValueError:
-        return d26 - timedelta(days=364)
+        return d - timedelta(days=364)
 
 
 
-def _break_align(d26, break_type):
+def _break_align(d, break_type, year=None, ref_year=None):
     """寒暑假对齐：将假期拆为 节前/节中/节后 三段分别按比例对齐，
     避免普通寒假日对齐到春节假期。"""
+    if year is None:
+        year = d.year
+    if ref_year is None:
+        ref_year = year - 1
+
     breaks = WINTER_BREAK if break_type == 'winter' else SUMMER_BREAK
-    b26_start = _parse(breaks[2026][0])
-    b26_end = _parse(breaks[2026][1])
-    b25_start = _parse(breaks[2025][0])
-    b25_end = _parse(breaks[2025][1])
+    if year not in breaks or ref_year not in breaks:
+        return _iso_week_align(d)
 
-    # 找26年和25年寒/暑假内的节假日段
-    hol26_start, hol26_end = None, None
-    for name, (s, e) in HOLIDAYS.get(2026, {}).items():
+    b_cur_start = _parse(breaks[year][0])
+    b_cur_end = _parse(breaks[year][1])
+    b_ref_start = _parse(breaks[ref_year][0])
+    b_ref_end = _parse(breaks[ref_year][1])
+
+    hol_cur_start, hol_cur_end = None, None
+    for name, (s, e) in HOLIDAYS.get(year, {}).items():
         hs, he = _parse(s), _parse(e)
-        if hs >= b26_start and he <= b26_end:
-            hol26_start, hol26_end = hs, he
+        if hs >= b_cur_start and he <= b_cur_end:
+            hol_cur_start, hol_cur_end = hs, he
             break
-    hol25_start, hol25_end = None, None
-    for name, (s, e) in HOLIDAYS.get(2025, {}).items():
+    hol_ref_start, hol_ref_end = None, None
+    for name, (s, e) in HOLIDAYS.get(ref_year, {}).items():
         hs, he = _parse(s), _parse(e)
-        if hs >= b25_start and he <= b25_end:
-            hol25_start, hol25_end = hs, he
+        if hs >= b_ref_start and he <= b_ref_end:
+            hol_ref_start, hol_ref_end = hs, he
             break
 
-    has_both_holidays = (hol26_start and hol25_start)
+    has_both_holidays = (hol_cur_start and hol_ref_start)
 
     if has_both_holidays:
-        # 判断d26落在哪个段
-        if hol26_start <= d26 <= hol26_end:
-            # 节假日段：按 align_date 的 P1 逻辑已处理，这里做 offset 对齐
-            offset = (d26 - hol26_start).days
-            hol25_len = (hol25_end - hol25_start).days
-            clamped_offset = min(offset, hol25_len)
-            candidate = hol25_start + timedelta(days=clamped_offset)
-        elif d26 < hol26_start:
-            # 节前段：按比例对齐到25年节前段
-            pre26_len = (hol26_start - b26_start).days
-            pre25_len = (hol25_start - b25_start).days
-            offset = (d26 - b26_start).days
-            if pre26_len > 0:
-                ratio = offset / pre26_len
-                mapped_offset = round(ratio * pre25_len)
+        if hol_cur_start <= d <= hol_cur_end:
+            offset = (d - hol_cur_start).days
+            hol_ref_len = (hol_ref_end - hol_ref_start).days
+            clamped_offset = min(offset, hol_ref_len)
+            candidate = hol_ref_start + timedelta(days=clamped_offset)
+        elif d < hol_cur_start:
+            pre_cur_len = (hol_cur_start - b_cur_start).days
+            pre_ref_len = (hol_ref_start - b_ref_start).days
+            offset = (d - b_cur_start).days
+            if pre_cur_len > 0:
+                ratio = offset / pre_cur_len
+                mapped_offset = round(ratio * pre_ref_len)
             else:
                 mapped_offset = offset
-            candidate = b25_start + timedelta(days=mapped_offset)
-            if candidate >= hol25_start:
-                candidate = hol25_start - timedelta(days=1)
+            candidate = b_ref_start + timedelta(days=mapped_offset)
+            if candidate >= hol_ref_start:
+                candidate = hol_ref_start - timedelta(days=1)
         else:
-            # 节后段：按比例对齐到25年节后段
-            post26_len = (b26_end - hol26_end).days
-            post25_len = (b25_end - hol25_end).days
-            offset = (d26 - hol26_end).days
-            if post26_len > 0:
-                ratio = offset / post26_len
-                mapped_offset = round(ratio * post25_len)
+            post_cur_len = (b_cur_end - hol_cur_end).days
+            post_ref_len = (b_ref_end - hol_ref_end).days
+            offset = (d - hol_cur_end).days
+            if post_cur_len > 0:
+                ratio = offset / post_cur_len
+                mapped_offset = round(ratio * post_ref_len)
             else:
                 mapped_offset = offset
-            candidate = hol25_end + timedelta(days=mapped_offset)
-            if candidate <= hol25_end:
-                candidate = hol25_end + timedelta(days=1)
+            candidate = hol_ref_end + timedelta(days=mapped_offset)
+            if candidate <= hol_ref_end:
+                candidate = hol_ref_end + timedelta(days=1)
     else:
-        # 无法识别假期段，退回简单偏移
-        offset = (d26 - b26_start).days
-        candidate = b25_start + timedelta(days=offset)
+        offset = (d - b_cur_start).days
+        candidate = b_ref_start + timedelta(days=offset)
 
-    # clamp 到25年假期范围
-    if candidate > b25_end:
-        candidate = b25_end
-    if candidate < b25_start:
-        candidate = b25_start
+    if candidate > b_ref_end:
+        candidate = b_ref_end
+    if candidate < b_ref_start:
+        candidate = b_ref_start
 
-    # 确保周中/周末性质一致
-    d26_weekend = _is_weekend(d26)
-    if _is_weekend(candidate) == d26_weekend:
+    d_weekend = _is_weekend(d)
+    if _is_weekend(candidate) == d_weekend:
         return candidate
 
     for delta in range(1, 4):
         for sign in [1, -1]:
             alt = candidate + timedelta(days=delta * sign)
-            if b25_start <= alt <= b25_end and _is_weekend(alt) == d26_weekend:
-                # 节前段不能越过节假日
-                if has_both_holidays and d26 < hol26_start and alt >= hol25_start:
+            if b_ref_start <= alt <= b_ref_end and _is_weekend(alt) == d_weekend:
+                if has_both_holidays and d < hol_cur_start and alt >= hol_ref_start:
                     continue
-                # 节后段不能越过节假日
-                if has_both_holidays and d26 > hol26_end and alt <= hol25_end:
+                if has_both_holidays and d > hol_cur_end and alt <= hol_ref_end:
                     continue
                 return alt
 
     return candidate
 
 
-def build_align_map(dates_26):
-    """批量对齐：[date] → {date_26: date_25}"""
-    return {d: align_date(d) for d in dates_26}
+def build_align_map(dates):
+    """批量对齐：[date] → {date: aligned_date}"""
+    return {d: align_date(d) for d in dates}
 
 
 def get_25_date_range(align_map):

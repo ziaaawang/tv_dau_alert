@@ -1318,19 +1318,15 @@ GROUP BY 1
 
 def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14, yoy_overrides=None,
                            manual_weekday_yoy=None, manual_weekend_yoy=None,
-                           weekday_slope=0.0, weekend_slope=0.0):
-    """天级DAU预估
-    df_26: 26年已有历史(log_date, dau)
-    df_25: 25年参考数据(log_date, dau)
-    align_map: {date_26: date_25}
-    forecast_dates: 需要预测的日期列表
-    ref_days: 用最近N天计算预测YoY
-    yoy_overrides: [{start: date, end: date, yoy: float, reason: str}]
-    """
+                           weekday_slope=0.0, weekend_slope=0.0,
+                           src_year=2026):
+    """天级DAU预估，src_year控制列名动态生成"""
     import io
     from calendar_config import _is_weekend
 
-    # 构建25年DAU字典
+    sy = src_year % 100
+    ry = (src_year - 1) % 100
+
     dau_25 = {}
     for _, row in df_25.iterrows():
         d = row['log_date']
@@ -1338,7 +1334,6 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
             d = datetime.strptime(d, '%Y%m%d').date()
         dau_25[d] = float(row['dau'])
 
-    # 构建26年DAU字典
     dau_26 = {}
     for _, row in df_26.iterrows():
         d = row['log_date']
@@ -1357,8 +1352,8 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
         dau_ref = dau_25.get(d25, 0) if d25 else 0
         yoy = (dau_actual / dau_ref - 1) * 100 if dau_ref > 0 else None
         hist_records.append({
-            '日期': d26, '26年DAU': dau_actual, '数据类型': '实际',
-            '25年参考日期': d25, '25年参考DAU': dau_ref, 'YoY%': yoy,
+            '日期': d26, f'{sy}年DAU': dau_actual, '数据类型': '实际',
+            f'{ry}年参考日期': d25, f'{ry}年参考DAU': dau_ref, 'YoY%': yoy,
             'is_weekend': _is_weekend(d26) or bool(_get_holiday_info(d26, d26.year)),
         })
 
@@ -1403,8 +1398,8 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
 
         predicted = round(dau_ref * (1 + yoy_rate / 100)) if dau_ref > 0 else 0
         forecast_records.append({
-            '日期': d26, '26年DAU': predicted, '数据类型': data_type,
-            '25年参考日期': d25, '25年参考DAU': dau_ref, 'YoY%': round(yoy_rate, 2),
+            '日期': d26, f'{sy}年DAU': predicted, '数据类型': data_type,
+            f'{ry}年参考日期': d25, f'{ry}年参考DAU': dau_ref, 'YoY%': round(yoy_rate, 2),
             'is_weekend': is_wknd,
         })
 
@@ -1497,6 +1492,16 @@ def _render_short_term_forecast():
     ref_days = st.slider("YoY参考天数（取最近N天均值）", 7, 30,
         value=saved.get('ref_days', 14), key="fc_ref_days")
 
+    src_year = hist_start.year
+    ref_year = src_year - 1
+    sy = src_year % 100
+    ry = ref_year % 100
+    col_src_dau = f'{sy}年DAU'
+    col_ref_date = f'{ry}年参考日期'
+    col_ref_dau = f'{ry}年参考DAU'
+    col_ref_week_date = f'{ry}年周对齐日期'
+    col_ref_week_dau = f'{ry}年周对齐DAU'
+
     # ── YoY手动调整 ──
     if 'fc_yoy_overrides' not in st.session_state:
         st.session_state['fc_yoy_overrides'] = []
@@ -1548,7 +1553,7 @@ def _render_short_term_forecast():
     elif has_data and params_changed:
         st.info("参数已变更，点击「运行预估」重新获取数据")
 
-    # 计算需要的所有26年日期和对齐
+    # 计算需要的所有源年日期和对齐
     all_26_dates = [hist_start + timedelta(days=i) for i in range((fc_end - hist_start).days + 1)]
     align_map = build_align_map(all_26_dates)
     week_align_map = {d: _iso_week_align(d) for d in all_26_dates}
@@ -1577,9 +1582,9 @@ def _render_short_term_forecast():
             status = st.empty()
             sql_26 = build_daily_dau_sql(hist_start_s, hist_end_s)
             sql_25 = build_daily_dau_sql(ref_min_s, ref_max_s)
-            with st.expander("查看SQL - 26年历史", expanded=False):
+            with st.expander(f"查看SQL - {sy}年历史", expanded=False):
                 st.code(sql_26, language="sql")
-            with st.expander("查看SQL - 25年参考", expanded=False):
+            with st.expander(f"查看SQL - {ry}年参考", expanded=False):
                 st.code(sql_25, language="sql")
             try:
                 status.warning("⏳ SQL执行中，请勿切换页面，否则需重新运行...")
@@ -1638,17 +1643,18 @@ def _render_short_term_forecast():
     result_df, weekday_yoy, weekend_yoy = compute_daily_forecast(
         df_26, df_25, align_map, forecast_dates, ref_days,
         yoy_overrides=st.session_state.get('fc_yoy_overrides'),
-        weekday_slope=wd_slope, weekend_slope=we_slope)
+        weekday_slope=wd_slope, weekend_slope=we_slope,
+        src_year=src_year)
 
-    # 添加25年周对齐DAU
+    # 添加周对齐DAU
     dau_25_lookup = {}
     for _, row in df_25.iterrows():
         d = row['log_date']
         if isinstance(d, str):
             d = datetime.strptime(d, '%Y%m%d').date()
         dau_25_lookup[d] = float(row['dau'])
-    result_df['25年周对齐日期'] = result_df['日期'].map(week_align_map)
-    result_df['25年周对齐DAU'] = result_df['25年周对齐日期'].map(
+    result_df[col_ref_week_date] = result_df['日期'].map(week_align_map)
+    result_df[col_ref_week_dau] = result_df[col_ref_week_date].map(
         lambda d: dau_25_lookup.get(d, 0) if d else 0)
 
     # ── AI预估结果 ──
@@ -1669,36 +1675,36 @@ def _render_short_term_forecast():
     dau_hover = '%{y:.0f}万'
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=hist_part['日期'], y=(hist_part['26年DAU'] / 1e4).round(0),
-        mode='lines', name='26年实际', line=dict(width=2, color='#1f77b4'),
-        hovertemplate='%{x}<br>26年实际: ' + dau_hover + '<extra></extra>'))
+        x=hist_part['日期'], y=(hist_part[col_src_dau] / 1e4).round(0),
+        mode='lines', name=f'{sy}年实际', line=dict(width=2, color='#1f77b4'),
+        hovertemplate='%{x}<br>' + f'{sy}年实际: ' + dau_hover + '<extra></extra>'))
     fc_combined = pd.concat([fc_part, fc_adj_part]).sort_values('日期')
     if not fc_combined.empty:
         fig.add_trace(go.Scatter(
-            x=fc_combined['日期'], y=(fc_combined['26年DAU'] / 1e4).round(0),
-            mode='lines', name='26年预估', line=dict(width=2, dash='dash', color='red'),
-            hovertemplate='%{x}<br>26年预估: ' + dau_hover + '<extra></extra>'))
+            x=fc_combined['日期'], y=(fc_combined[col_src_dau] / 1e4).round(0),
+            mode='lines', name=f'{sy}年预估', line=dict(width=2, dash='dash', color='red'),
+            hovertemplate='%{x}<br>' + f'{sy}年预估: ' + dau_hover + '<extra></extra>'))
     if not fc_adj_part.empty:
         fig.add_trace(go.Scatter(
-            x=fc_adj_part['日期'], y=(fc_adj_part['26年DAU'] / 1e4).round(0),
+            x=fc_adj_part['日期'], y=(fc_adj_part[col_src_dau] / 1e4).round(0),
             mode='markers', name='YoY调整点',
             marker=dict(size=8, symbol='diamond', color='orange'),
             hovertemplate='%{x}<br>预估(调整): ' + dau_hover + '<extra></extra>'))
     fig.add_trace(go.Scatter(
-        x=result_df['日期'], y=(result_df['25年参考DAU'] / 1e4).round(0),
-        mode='lines', name='25年参考日期', line=dict(width=1, dash='dot', color='gray'),
-        hovertemplate='%{x}<br>25年参考日期: ' + dau_hover + '<extra></extra>'))
+        x=result_df['日期'], y=(result_df[col_ref_dau] / 1e4).round(0),
+        mode='lines', name=f'{ry}年参考日期', line=dict(width=1, dash='dot', color='gray'),
+        hovertemplate='%{x}<br>' + f'{ry}年参考日期: ' + dau_hover + '<extra></extra>'))
     fig.add_trace(go.Scatter(
-        x=result_df['日期'], y=(result_df['25年周对齐DAU'] / 1e4).round(0),
-        mode='lines', name='25年周对齐', line=dict(width=1, dash='dashdot', color='#ff7f0e'),
-        hovertemplate='%{x}<br>25年周对齐: ' + dau_hover + '<extra></extra>'))
+        x=result_df['日期'], y=(result_df[col_ref_week_dau] / 1e4).round(0),
+        mode='lines', name=f'{ry}年周对齐', line=dict(width=1, dash='dashdot', color='#ff7f0e'),
+        hovertemplate='%{x}<br>' + f'{ry}年周对齐: ' + dau_hover + '<extra></extra>'))
     fig.update_layout(title="每日DAU趋势与预估（AI）", xaxis_title="日期", yaxis_title="DAU(万)",
                       height=450, legend=dict(orientation="h", y=-0.12))
     st.plotly_chart(fig, use_container_width=True)
 
     # 预测明细表
     with st.expander("AI预测明细表", expanded=False):
-        show_df = result_df[['日期', '26年DAU', '数据类型', '25年参考日期', '25年参考DAU', 'YoY%']].copy()
+        show_df = result_df[['日期', col_src_dau, '数据类型', col_ref_date, col_ref_dau, 'YoY%']].copy()
         WEEKDAY_NAMES = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
         def _weekday_label(d):
             if not d or pd.isna(d):
@@ -1712,26 +1718,28 @@ def _render_short_term_forecast():
             elif _is_transfer_work(d, d.year):
                 label += '（调休上班）'
             return label
-        show_df.insert(1, '26年周', show_df['日期'].apply(_weekday_label))
-        show_df.insert(show_df.columns.get_loc('25年参考日期') + 1, '25年周',
-                       show_df['25年参考日期'].apply(_weekday_label))
-        show_df['26年DAU'] = (show_df['26年DAU'] / 1e4).round(1)
-        show_df['25年参考DAU'] = (show_df['25年参考DAU'] / 1e4).round(1)
+        col_src_week = f'{sy}年周'
+        col_ref_week = f'{ry}年周'
+        show_df.insert(1, col_src_week, show_df['日期'].apply(_weekday_label))
+        show_df.insert(show_df.columns.get_loc(col_ref_date) + 1, col_ref_week,
+                       show_df[col_ref_date].apply(_weekday_label))
+        show_df[col_src_dau] = (show_df[col_src_dau] / 1e4).round(1)
+        show_df[col_ref_dau] = (show_df[col_ref_dau] / 1e4).round(1)
         show_df['YoY%'] = show_df['YoY%'].round(1)
-        show_df.columns = ['26年日期', '周', '26年DAU(万)', '类型', '25年参考日期', '周(25)', '25年DAU(万)', 'YoY%']
+        disp_cols = [f'{sy}年日期', '周', f'{sy}年DAU(万)', '类型', f'{ry}年参考日期', f'周({ry})', f'{ry}年DAU(万)', 'YoY%']
+        show_df.columns = disp_cols
 
         all_cols = list(show_df.columns)
-        default_cols = ['26年日期', '周', '26年DAU(万)', '类型', '25年参考日期', '周(25)', '25年DAU(万)', 'YoY%']
-        selected_cols = st.multiselect("展示列", all_cols, default=default_cols, key="fc_detail_cols")
+        selected_cols = st.multiselect("展示列", all_cols, default=disp_cols, key="fc_detail_cols")
         if not selected_cols:
-            selected_cols = default_cols
+            selected_cols = disp_cols
         st.dataframe(show_df[selected_cols], use_container_width=True, height=400)
 
     # Excel导出
-    export_df = result_df[['日期', '26年DAU', '25年参考日期', '25年参考DAU', 'YoY%']].copy()
-    export_df.columns = ['26年日期', '26年DAU', '同比25年参考日期', '25年参考DAU', 'YoY%']
-    export_df['26年日期'] = export_df['26年日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
-    export_df['同比25年参考日期'] = export_df['同比25年参考日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
+    export_df = result_df[['日期', col_src_dau, col_ref_date, col_ref_dau, 'YoY%']].copy()
+    export_df.columns = [f'{sy}年日期', f'{sy}年DAU', f'同比{ry}年参考日期', f'{ry}年参考DAU', 'YoY%']
+    export_df[f'{sy}年日期'] = export_df[f'{sy}年日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
+    export_df[f'同比{ry}年参考日期'] = export_df[f'同比{ry}年参考日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
     export_df['YoY%'] = export_df['YoY%'].round(2)
 
     buffer = io.BytesIO()
@@ -1754,9 +1762,10 @@ def _render_short_term_forecast():
         df_26, df_25, align_map, forecast_dates, ref_days,
         yoy_overrides=st.session_state.get('fc_yoy_overrides'),
         manual_weekday_yoy=manual_wd_yoy, manual_weekend_yoy=manual_we_yoy,
-        weekday_slope=wd_slope, weekend_slope=we_slope)
-    manual_result_df['25年周对齐日期'] = manual_result_df['日期'].map(week_align_map)
-    manual_result_df['25年周对齐DAU'] = manual_result_df['25年周对齐日期'].map(
+        weekday_slope=wd_slope, weekend_slope=we_slope,
+        src_year=src_year)
+    manual_result_df[col_ref_week_date] = manual_result_df['日期'].map(week_align_map)
+    manual_result_df[col_ref_week_dau] = manual_result_df[col_ref_week_date].map(
         lambda d: dau_25_lookup.get(d, 0) if d else 0)
 
     m_hist = manual_result_df[manual_result_df['数据类型'] == '实际'].copy()
@@ -1765,49 +1774,49 @@ def _render_short_term_forecast():
 
     fig_m = go.Figure()
     fig_m.add_trace(go.Scatter(
-        x=m_hist['日期'], y=(m_hist['26年DAU'] / 1e4).round(0),
-        mode='lines', name='26年实际', line=dict(width=2, color='#1f77b4'),
-        hovertemplate='%{x}<br>26年实际: ' + dau_hover + '<extra></extra>'))
+        x=m_hist['日期'], y=(m_hist[col_src_dau] / 1e4).round(0),
+        mode='lines', name=f'{sy}年实际', line=dict(width=2, color='#1f77b4'),
+        hovertemplate='%{x}<br>' + f'{sy}年实际: ' + dau_hover + '<extra></extra>'))
     if not m_fc.empty:
         fig_m.add_trace(go.Scatter(
-            x=m_fc['日期'], y=(m_fc['26年DAU'] / 1e4).round(0),
-            mode='lines', name='26年预估(人工)', line=dict(width=2, dash='dash', color='#2ca02c'),
-            hovertemplate='%{x}<br>26年预估(人工): ' + dau_hover + '<extra></extra>'))
+            x=m_fc['日期'], y=(m_fc[col_src_dau] / 1e4).round(0),
+            mode='lines', name=f'{sy}年预估(人工)', line=dict(width=2, dash='dash', color='#2ca02c'),
+            hovertemplate='%{x}<br>' + f'{sy}年预估(人工): ' + dau_hover + '<extra></extra>'))
     if not m_fc_adj.empty:
         fig_m.add_trace(go.Scatter(
-            x=m_fc_adj['日期'], y=(m_fc_adj['26年DAU'] / 1e4).round(0),
+            x=m_fc_adj['日期'], y=(m_fc_adj[col_src_dau] / 1e4).round(0),
             mode='markers', name='YoY调整点',
             marker=dict(size=8, symbol='diamond', color='orange'),
             hovertemplate='%{x}<br>预估(调整): ' + dau_hover + '<extra></extra>'))
     fig_m.add_trace(go.Scatter(
-        x=manual_result_df['日期'], y=(manual_result_df['25年参考DAU'] / 1e4).round(0),
-        mode='lines', name='25年参考日期', line=dict(width=1, dash='dot', color='gray'),
-        hovertemplate='%{x}<br>25年参考日期: ' + dau_hover + '<extra></extra>'))
+        x=manual_result_df['日期'], y=(manual_result_df[col_ref_dau] / 1e4).round(0),
+        mode='lines', name=f'{ry}年参考日期', line=dict(width=1, dash='dot', color='gray'),
+        hovertemplate='%{x}<br>' + f'{ry}年参考日期: ' + dau_hover + '<extra></extra>'))
     fig_m.add_trace(go.Scatter(
-        x=manual_result_df['日期'], y=(manual_result_df['25年周对齐DAU'] / 1e4).round(0),
-        mode='lines', name='25年周对齐', line=dict(width=1, dash='dashdot', color='#ff7f0e'),
-        hovertemplate='%{x}<br>25年周对齐: ' + dau_hover + '<extra></extra>'))
+        x=manual_result_df['日期'], y=(manual_result_df[col_ref_week_dau] / 1e4).round(0),
+        mode='lines', name=f'{ry}年周对齐', line=dict(width=1, dash='dashdot', color='#ff7f0e'),
+        hovertemplate='%{x}<br>' + f'{ry}年周对齐: ' + dau_hover + '<extra></extra>'))
     fig_m.update_layout(title="每日DAU趋势与预估（人工）", xaxis_title="日期", yaxis_title="DAU(万)",
                         height=450, legend=dict(orientation="h", y=-0.12))
     st.plotly_chart(fig_m, use_container_width=True)
 
     # 人工预测明细表
     with st.expander("人工预测明细表", expanded=False):
-        m_show = manual_result_df[['日期', '26年DAU', '数据类型', '25年参考日期', '25年参考DAU', 'YoY%']].copy()
-        m_show.insert(1, '26年周', m_show['日期'].apply(_weekday_label))
-        m_show.insert(m_show.columns.get_loc('25年参考日期') + 1, '25年周',
-                      m_show['25年参考日期'].apply(_weekday_label))
-        m_show['26年DAU'] = (m_show['26年DAU'] / 1e4).round(1)
-        m_show['25年参考DAU'] = (m_show['25年参考DAU'] / 1e4).round(1)
+        m_show = manual_result_df[['日期', col_src_dau, '数据类型', col_ref_date, col_ref_dau, 'YoY%']].copy()
+        m_show.insert(1, col_src_week, m_show['日期'].apply(_weekday_label))
+        m_show.insert(m_show.columns.get_loc(col_ref_date) + 1, col_ref_week,
+                      m_show[col_ref_date].apply(_weekday_label))
+        m_show[col_src_dau] = (m_show[col_src_dau] / 1e4).round(1)
+        m_show[col_ref_dau] = (m_show[col_ref_dau] / 1e4).round(1)
         m_show['YoY%'] = m_show['YoY%'].round(1)
-        m_show.columns = ['26年日期', '周', '26年DAU(万)', '类型', '25年参考日期', '周(25)', '25年DAU(万)', 'YoY%']
+        m_show.columns = disp_cols
         st.dataframe(m_show, use_container_width=True, height=400)
 
     # 人工预估导出
-    m_export = manual_result_df[['日期', '26年DAU', '25年参考日期', '25年参考DAU', 'YoY%']].copy()
-    m_export.columns = ['26年日期', '26年DAU', '同比25年参考日期', '25年参考DAU', 'YoY%']
-    m_export['26年日期'] = m_export['26年日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
-    m_export['同比25年参考日期'] = m_export['同比25年参考日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
+    m_export = manual_result_df[['日期', col_src_dau, col_ref_date, col_ref_dau, 'YoY%']].copy()
+    m_export.columns = [f'{sy}年日期', f'{sy}年DAU', f'同比{ry}年参考日期', f'{ry}年参考DAU', 'YoY%']
+    m_export[f'{sy}年日期'] = m_export[f'{sy}年日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
+    m_export[f'同比{ry}年参考日期'] = m_export[f'同比{ry}年参考日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
     m_export['YoY%'] = m_export['YoY%'].round(2)
 
     m_buffer = io.BytesIO()
