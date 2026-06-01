@@ -164,7 +164,6 @@ def execute_sql(sql, status_placeholder=None):
 # LLM 对话层
 # ═══════════════════════════════════════════
 
-@st.cache_resource
 def get_llm_client():
     return OpenAI(api_key=LLM_TOKEN, base_url=LLM_BASE_URL)
 
@@ -1316,10 +1315,25 @@ GROUP BY 1
 """
 
 
+def _get_holiday_factor(d, holiday_factors):
+    """查询某天是否命中假期因子，返回 (yoy_rate, factor_name) 或 None"""
+    if not holiday_factors:
+        return None
+    from calendar_config import _is_weekend, _get_holiday_info
+    is_wknd = _is_weekend(d) or bool(_get_holiday_info(d, d.year))
+    for hf in holiday_factors:
+        if not hf.get('enabled', True):
+            continue
+        if hf['start'] <= d <= hf['end']:
+            key = 'weekend_yoy' if is_wknd else 'weekday_yoy'
+            return hf[key], hf['name']
+    return None
+
+
 def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14, yoy_overrides=None,
                            manual_weekday_yoy=None, manual_weekend_yoy=None,
                            weekday_slope=0.0, weekend_slope=0.0,
-                           src_year=2026):
+                           src_year=2026, holiday_factors=None):
     """天级DAU预估，src_year控制列名动态生成"""
     import io
     from calendar_config import _is_weekend
@@ -1378,7 +1392,7 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
         dau_ref = dau_25.get(d25, 0) if d25 else 0
         is_wknd = _is_weekend(d26) or bool(_get_holiday_info(d26, d26.year))
 
-        # 检查是否有手动覆盖
+        # 优先级1：手动日期覆盖
         override_hit = None
         if yoy_overrides:
             for ov in yoy_overrides:
@@ -1390,11 +1404,18 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
             yoy_rate = override_hit['yoy']
             data_type = '预估(调整)'
         else:
-            base_yoy = weekend_avg_yoy if is_wknd else weekday_avg_yoy
-            slope = weekend_slope if is_wknd else weekday_slope
-            weeks_ahead = max(0, (d26 - last_hist_date).days) / 7
-            yoy_rate = base_yoy + slope * weeks_ahead
-            data_type = '预估'
+            # 优先级2：假期因子
+            hf_hit = _get_holiday_factor(d26, holiday_factors)
+            if hf_hit:
+                yoy_rate = hf_hit[0]
+                data_type = f'预估({hf_hit[1]})'
+            else:
+                # 优先级3：基础工作日/周末YoY + 趋势斜率
+                base_yoy = weekend_avg_yoy if is_wknd else weekday_avg_yoy
+                slope = weekend_slope if is_wknd else weekday_slope
+                weeks_ahead = max(0, (d26 - last_hist_date).days) / 7
+                yoy_rate = base_yoy + slope * weeks_ahead
+                data_type = '预估'
 
         predicted = round(dau_ref * (1 + yoy_rate / 100)) if dau_ref > 0 else 0
         forecast_records.append({
@@ -1540,6 +1561,178 @@ def _render_short_term_forecast():
                         st.session_state['fc_yoy_overrides'].pop(i)
                         st.rerun()
 
+    # ── 假期因子 ──
+    if 'fc_holiday_factors' not in st.session_state:
+        # 内置默认：暑假（7/1~8/31）、寒假（用户每年手动确认区间）
+        st.session_state['fc_holiday_factors'] = [
+            {
+                'name': '暑假',
+                'start': date(src_year, 7, 1),
+                'end': date(src_year, 8, 31),
+                'weekday_yoy': 35.0,
+                'weekend_yoy': 30.0,
+                'enabled': True,
+            },
+            {
+                'name': '寒假',
+                'start': date(src_year, 1, 15),
+                'end': date(src_year, 2, 15),
+                'weekday_yoy': 28.0,
+                'weekend_yoy': 25.0,
+                'enabled': False,
+            },
+        ]
+
+    with st.expander("🏖️ 假期因子（暑假/寒假工作日YoY单独设置）", expanded=False):
+        st.caption("假期内工作日行为接近周末，需单独设YoY。优先级低于「手动日期覆盖」，高于基础工作日/周末YoY。")
+
+        # 自动计算函数：从历史数据算去年同假期区间的实际YoY
+        def _auto_calc_hf_yoy(hf_start, hf_end):
+            """用已加载的历史数据，计算去年同期（对比前年）的实际YoY，分工作日/周末返回"""
+            if 'fc_data_26' not in st.session_state or 'fc_data_25' not in st.session_state:
+                return None, None, None
+            from calendar_config import _is_weekend, _get_holiday_info
+
+            df_hist = st.session_state['fc_data_26'].copy()
+            df_ref = st.session_state['fc_data_25'].copy()
+
+            # 把历史数据转为 date→dau 字典
+            dau_hist = {}
+            for _, row in df_hist.iterrows():
+                d = row['log_date']
+                if isinstance(d, str):
+                    d = datetime.strptime(d, '%Y%m%d').date()
+                dau_hist[d] = float(row['dau'])
+
+            dau_ref = {}
+            for _, row in df_ref.iterrows():
+                d = row['log_date']
+                if isinstance(d, str):
+                    d = datetime.strptime(d, '%Y%m%d').date()
+                dau_ref[d] = float(row['dau'])
+
+            # 去年同假期区间
+            last_year = hf_start.year - 1
+            try:
+                ly_start = hf_start.replace(year=last_year)
+                ly_end = hf_end.replace(year=last_year)
+            except ValueError:
+                ly_start = hf_start.replace(year=last_year, day=28)
+                ly_end = hf_end.replace(year=last_year, day=28)
+
+            wd_yoys, we_yoys = [], []
+            d = ly_start
+            while d <= ly_end:
+                # 去年历史DAU
+                hist_dau = dau_hist.get(d)
+                # 前年参考DAU（用align_map对齐，或直接找前年同日期）
+                d_ref_candidate = align_map.get(d)
+                ref_dau = dau_ref.get(d_ref_candidate) if d_ref_candidate else None
+                if ref_dau is None:
+                    try:
+                        d_prev_year = d.replace(year=d.year - 1)
+                        ref_dau = dau_ref.get(d_prev_year)
+                    except ValueError:
+                        pass
+
+                if hist_dau and ref_dau and ref_dau > 0:
+                    yoy = (hist_dau / ref_dau - 1) * 100
+                    is_wknd = _is_weekend(d) or bool(_get_holiday_info(d, d.year))
+                    if is_wknd:
+                        we_yoys.append(yoy)
+                    else:
+                        wd_yoys.append(yoy)
+                d += timedelta(days=1)
+
+            wd_avg = round(sum(wd_yoys) / len(wd_yoys), 1) if wd_yoys else None
+            we_avg = round(sum(we_yoys) / len(we_yoys), 1) if we_yoys else None
+            sample_n = len(wd_yoys) + len(we_yoys)
+            return wd_avg, we_avg, sample_n
+
+        has_hist_data = 'fc_data_26' in st.session_state
+
+        hf_list = st.session_state['fc_holiday_factors']
+        for i, hf in enumerate(hf_list):
+            with st.container():
+                st.markdown(f"**{hf['name']}**")
+                hc1, hc2, hc3 = st.columns([1, 2, 2])
+                with hc1:
+                    enabled = st.checkbox("启用", value=hf['enabled'], key=f"hf_enabled_{i}")
+                    hf_list[i]['enabled'] = enabled
+                with hc2:
+                    hf_list[i]['start'] = st.date_input(
+                        "起始", value=hf['start'], key=f"hf_start_{i}")
+                with hc3:
+                    hf_list[i]['end'] = st.date_input(
+                        "截止", value=hf['end'], key=f"hf_end_{i}")
+
+                hc4, hc5, hc6, hc7 = st.columns([1.5, 1.5, 2, 1])
+                with hc4:
+                    hf_list[i]['weekday_yoy'] = st.number_input(
+                        "工作日YoY%", value=hf['weekday_yoy'], step=1.0, format="%.1f",
+                        key=f"hf_wd_{i}")
+                with hc5:
+                    hf_list[i]['weekend_yoy'] = st.number_input(
+                        "周末YoY%", value=hf['weekend_yoy'], step=1.0, format="%.1f",
+                        key=f"hf_we_{i}")
+                with hc6:
+                    if has_hist_data:
+                        if st.button(f"📊 自动计算（参考去年同期）", key=f"hf_auto_{i}"):
+                            wd_auto, we_auto, n = _auto_calc_hf_yoy(
+                                hf_list[i]['start'], hf_list[i]['end'])
+                            if wd_auto is not None:
+                                hf_list[i]['weekday_yoy'] = wd_auto
+                                hf_list[i]['weekend_yoy'] = we_auto if we_auto is not None else wd_auto
+                                st.session_state[f'hf_auto_result_{i}'] = (wd_auto, we_auto, n)
+                                st.rerun()
+                            else:
+                                st.warning("历史数据中未找到去年同期数据，请先加载更长区间的历史数据")
+                    else:
+                        st.caption("先运行预估加载历史数据，再自动计算")
+                with hc7:
+                    if st.button("🗑", key=f"del_hf_{i}"):
+                        st.session_state['fc_holiday_factors'].pop(i)
+                        st.session_state.pop(f'hf_auto_result_{i}', None)
+                        st.rerun()
+
+                # 显示自动计算结果说明
+                if f'hf_auto_result_{i}' in st.session_state:
+                    wd_r, we_r, n_r = st.session_state[f'hf_auto_result_{i}']
+                    last_year = hf_list[i]['start'].year - 1
+                    st.caption(
+                        f"📊 参考去年同期（{last_year}年）实际YoY — "
+                        f"工作日均值 **{wd_r:+.1f}%**，周末均值 **{we_r:+.1f}%**（样本{n_r}天），可在上方手动微调")
+
+                st.markdown("---")
+
+        # 新增自定义假期
+        st.markdown("**添加自定义假期**")
+        nc1, nc2, nc3, nc4, nc5 = st.columns([2, 2, 2, 1.5, 1.5])
+        with nc1:
+            new_hf_name = st.text_input("假期名称", value="", placeholder="如：秋假", key="new_hf_name")
+        with nc2:
+            new_hf_start = st.date_input("起始", value=fc_start, key="new_hf_start")
+        with nc3:
+            new_hf_end = st.date_input("截止", value=fc_start, key="new_hf_end")
+        with nc4:
+            new_hf_wd = st.number_input("工作日YoY%", value=30.0, step=1.0, format="%.1f", key="new_hf_wd")
+        with nc5:
+            new_hf_we = st.number_input("周末YoY%", value=28.0, step=1.0, format="%.1f", key="new_hf_we")
+
+        if st.button("➕ 添加假期因子", key="btn_add_hf"):
+            if new_hf_name and new_hf_start <= new_hf_end:
+                st.session_state['fc_holiday_factors'].append({
+                    'name': new_hf_name,
+                    'start': new_hf_start,
+                    'end': new_hf_end,
+                    'weekday_yoy': new_hf_wd,
+                    'weekend_yoy': new_hf_we,
+                    'enabled': True,
+                })
+                st.rerun()
+            else:
+                st.warning("请填写假期名称，且起始日不能晚于截止日")
+
     # 检查是否有已缓存的数据可直接展示
     has_data = 'fc_data_26' in st.session_state and 'fc_data_25' in st.session_state
 
@@ -1644,7 +1837,8 @@ def _render_short_term_forecast():
         df_26, df_25, align_map, forecast_dates, ref_days,
         yoy_overrides=st.session_state.get('fc_yoy_overrides'),
         weekday_slope=wd_slope, weekend_slope=we_slope,
-        src_year=src_year)
+        src_year=src_year,
+        holiday_factors=st.session_state.get('fc_holiday_factors'))
 
     # 添加周对齐DAU
     dau_25_lookup = {}
@@ -1763,7 +1957,8 @@ def _render_short_term_forecast():
         yoy_overrides=st.session_state.get('fc_yoy_overrides'),
         manual_weekday_yoy=manual_wd_yoy, manual_weekend_yoy=manual_we_yoy,
         weekday_slope=wd_slope, weekend_slope=we_slope,
-        src_year=src_year)
+        src_year=src_year,
+        holiday_factors=st.session_state.get('fc_holiday_factors'))
     manual_result_df[col_ref_week_date] = manual_result_df['日期'].map(week_align_map)
     manual_result_df[col_ref_week_dau] = manual_result_df[col_ref_week_date].map(
         lambda d: dau_25_lookup.get(d, 0) if d else 0)
@@ -1824,6 +2019,116 @@ def _render_short_term_forecast():
     st.download_button("📥 导出Excel（人工预估）", data=m_buffer.getvalue(),
                        file_name="DAU预估_人工.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        key="btn_export_manual")
+
+    # ── 预估探讨 ──
+    st.markdown("---")
+    st.subheader("💬 预估探讨")
+    _render_forecast_chat(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
+
+
+def _format_forecast_for_llm(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
+    """将预估数据格式化为LLM可读的文本摘要"""
+    sy = src_year % 100
+    ry = (src_year - 1) % 100
+    col_src = f'{sy}年DAU'
+
+    lines = []
+    lines.append(f"### 预估参数")
+    lines.append(f"预测区间: {fc_start} ~ {fc_end}")
+    lines.append(f"AI预估YoY基准: 周中 {weekday_yoy:+.1f}%, 周末 {weekend_yoy:+.1f}%")
+    lines.append("")
+
+    # 按月汇总 AI预估
+    ai_fc = result_df[result_df['数据类型'].isin(['预估', '预估(调整)'])].copy()
+    if not ai_fc.empty:
+        ai_fc['月份'] = ai_fc['日期'].apply(lambda d: f"{d.year}年{d.month}月")
+        monthly_ai = ai_fc.groupby('月份').agg(
+            日均DAU=(col_src, 'mean'),
+            天数=(col_src, 'count'),
+            平均YoY=('YoY%', 'mean')
+        ).reset_index()
+        lines.append("### AI预估 — 月度汇总（日均DAU，万）")
+        for _, r in monthly_ai.iterrows():
+            lines.append(f"- {r['月份']}: 日均DAU {r['日均DAU']/1e4:.1f}万, YoY {r['平均YoY']:+.1f}%, 预估天数{r['天数']}天")
+        lines.append("")
+
+    # 按月汇总 人工预估
+    col_src_m = f'{sy}年DAU'
+    man_fc = manual_result_df[manual_result_df['数据类型'].isin(['预估', '预估(调整)'])].copy()
+    if not man_fc.empty:
+        man_fc['月份'] = man_fc['日期'].apply(lambda d: f"{d.year}年{d.month}月")
+        monthly_man = man_fc.groupby('月份').agg(
+            日均DAU=(col_src_m, 'mean'),
+            平均YoY=('YoY%', 'mean')
+        ).reset_index()
+        lines.append("### 人工预估 — 月度汇总（日均DAU，万）")
+        for _, r in monthly_man.iterrows():
+            lines.append(f"- {r['月份']}: 日均DAU {r['日均DAU']/1e4:.1f}万, YoY {r['平均YoY']:+.1f}%")
+        lines.append("")
+
+    # 历史最近14天实际
+    hist = result_df[result_df['数据类型'] == '实际'].tail(14).copy()
+    if not hist.empty:
+        lines.append(f"### 最近历史实际（近14天）")
+        for _, r in hist.iterrows():
+            lines.append(f"- {r['日期']}: DAU {r[col_src]/1e4:.1f}万, YoY {r['YoY%']:+.1f}%")
+        lines.append("")
+
+    return '\n'.join(lines)
+
+
+def build_forecast_system_prompt(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
+    data_summary = _format_forecast_for_llm(
+        result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
+    sy = src_year % 100
+    ry = (src_year - 1) % 100
+
+    return f"""你是B站TV端（OTT）DAU预估专家，熟悉OTT业务规律和预估方法论。
+用户正在使用DAU预估工具，你需要基于下方的预估数据和业务知识来回答问题。
+
+## 当前预估数据
+{data_summary}
+
+{OTT_KNOWLEDGE}
+
+## 回答要求
+1. 必须引用具体数字（如"预估6月日均DAU约1200万，YoY +25%"），不要给模糊答案
+2. AI预估和人工预估结果如有差异，指出差异并说明原因
+3. 结合季节性规律（暑假/节假日/月末等）解释预估逻辑
+4. 如果问题超出当前预估区间，坦诚告知
+5. 简洁有力，用要点形式组织，避免空泛"""
+
+
+def _render_forecast_chat(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
+    """预估探讨对话框"""
+    st.caption("基于当前预估数据，追问预估结果、探讨假设场景")
+
+    if 'fc_chat_history' not in st.session_state:
+        st.session_state['fc_chat_history'] = []
+
+    for msg in st.session_state['fc_chat_history']:
+        with st.chat_message(msg['role'], avatar="🧑‍💻" if msg['role'] == 'user' else "📈"):
+            st.markdown(msg['content'])
+
+    if prompt := st.chat_input("输入问题，如：预估6月整体日均DAU是多少？YoY是多少？", key="fc_chat_input"):
+        st.session_state['fc_chat_history'].append({"role": "user", "content": prompt})
+        with st.chat_message("user", avatar="🧑‍💻"):
+            st.markdown(prompt)
+
+        sys_prompt = build_forecast_system_prompt(
+            result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
+        chat_hist = [{"role": m["role"], "content": m["content"]}
+                     for m in st.session_state['fc_chat_history'][:-1]]
+
+        with st.chat_message("assistant", avatar="📈"):
+            try:
+                client = get_llm_client()
+                response_text = st.write_stream(chat_stream(client, prompt, sys_prompt, chat_hist))
+                st.session_state['fc_chat_history'].append({"role": "assistant", "content": response_text})
+            except Exception as e:
+                error_msg = f"对话服务暂时不可用: {e}"
+                st.error(error_msg)
+                st.session_state['fc_chat_history'].append({"role": "assistant", "content": error_msg})
 
 
 def build_monthly_new_users_sql(n_months=18):
