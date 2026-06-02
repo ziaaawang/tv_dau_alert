@@ -1586,15 +1586,104 @@ def _render_short_term_forecast():
     with st.expander("🏖️ 假期因子（暑假/寒假工作日YoY单独设置）", expanded=False):
         st.caption("假期内工作日行为接近周末，需单独设YoY。优先级低于「手动日期覆盖」，高于基础工作日/周末YoY。")
 
-        # 自动计算函数：从历史数据算去年同假期区间的实际YoY
+        # ── 独立加载去年同期数据（不依赖主预估历史数据）──
+        hf_list_preview = st.session_state.get('fc_holiday_factors', [])
+        enabled_hfs = [hf for hf in hf_list_preview if hf.get('enabled', True)]
+        if enabled_hfs:
+            # 计算所有启用假期的去年同期区间，合并为最小查询范围
+            ly_starts = []
+            ly_ends = []
+            lyy_starts = []  # 前年（对比基准）
+            lyy_ends = []
+            for hf in hf_list_preview:
+                last_year = hf['start'].year - 1
+                try:
+                    ly_s = hf['start'].replace(year=last_year)
+                    ly_e = hf['end'].replace(year=last_year)
+                except ValueError:
+                    ly_s = hf['start'].replace(year=last_year, day=28)
+                    ly_e = hf['end'].replace(year=last_year, day=28)
+                ly_starts.append(ly_s)
+                ly_ends.append(ly_e)
+                prev_year = last_year - 1
+                try:
+                    lyy_starts.append(hf['start'].replace(year=prev_year))
+                    lyy_ends.append(hf['end'].replace(year=prev_year))
+                except ValueError:
+                    lyy_starts.append(hf['start'].replace(year=prev_year, day=28))
+                    lyy_ends.append(hf['end'].replace(year=prev_year, day=28))
+
+            hf_ly_min_default = min(ly_starts)
+            hf_ly_max_default = max(ly_ends)
+            hf_lyy_min_default = min(lyy_starts)
+            hf_lyy_max_default = max(lyy_ends)
+
+            # 支持手动调整查询区间
+            rd1, rd2, rd3, rd4 = st.columns(4)
+            with rd1:
+                hf_ly_start_input = st.date_input("去年同期 起始",
+                    value=st.session_state.get('hf_ly_start_input', hf_ly_min_default),
+                    key="hf_ly_start_input")
+            with rd2:
+                hf_ly_end_input = st.date_input("去年同期 截止",
+                    value=st.session_state.get('hf_ly_end_input', hf_ly_max_default),
+                    key="hf_ly_end_input")
+            with rd3:
+                hf_lyy_start_input = st.date_input("前年同期 起始",
+                    value=st.session_state.get('hf_lyy_start_input', hf_lyy_min_default),
+                    key="hf_lyy_start_input")
+            with rd4:
+                hf_lyy_end_input = st.date_input("前年同期 截止",
+                    value=st.session_state.get('hf_lyy_end_input', hf_lyy_max_default),
+                    key="hf_lyy_end_input")
+
+            hf_ly_min = hf_ly_start_input.strftime('%Y%m%d')
+            hf_ly_max = hf_ly_end_input.strftime('%Y%m%d')
+            hf_lyy_min = hf_lyy_start_input.strftime('%Y%m%d')
+            hf_lyy_max = hf_lyy_end_input.strftime('%Y%m%d')
+
+            hf_data_loaded = 'hf_data_ly' in st.session_state and 'hf_data_lyy' in st.session_state
+            if hf_data_loaded:
+                st.success(f"✅ 去年同期数据已加载（{hf_ly_min[:6]} ~ {hf_ly_max[:6]}），如需重新加载请点击下方按钮")
+
+            load_col, reload_col = st.columns([2, 1])
+            with load_col:
+                btn_label = "🔄 重新加载去年同期数据" if hf_data_loaded else "📥 加载去年同期数据"
+                if st.button(btn_label, key="btn_load_hf_data"):
+                    _status = st.empty()
+                    sql_ly = build_daily_dau_sql(hf_ly_min, hf_ly_max)
+                    sql_lyy = build_daily_dau_sql(hf_lyy_min, hf_lyy_max)
+                    try:
+                        _status.info("正在查询去年同期数据...")
+                        df_ly = execute_sql(sql_ly, _status)
+                        df_ly['dau'] = pd.to_numeric(df_ly['dau'], errors='coerce').fillna(0)
+                        _status.info("正在查询前年同期数据...")
+                        df_lyy = execute_sql(sql_lyy, _status)
+                        df_lyy['dau'] = pd.to_numeric(df_lyy['dau'], errors='coerce').fillna(0)
+                        st.session_state['hf_data_ly'] = df_ly
+                        st.session_state['hf_data_lyy'] = df_lyy
+                        _status.success("✅ 去年同期数据加载完成")
+                        st.rerun()
+                    except Exception as e:
+                        _status.error(f"加载失败: {e}")
+
+        # 自动计算函数：优先用独立加载的去年同期数据，其次用主预估历史数据
         def _auto_calc_hf_yoy(hf_start, hf_end):
-            """用已加载的历史数据，计算去年同期（对比前年）的实际YoY，分工作日/周末返回"""
-            if 'fc_data_26' not in st.session_state or 'fc_data_25' not in st.session_state:
-                return None, None, None
+            """用去年同期数据，计算去年同期（对比前年）的实际YoY，分工作日/周末返回"""
             from calendar_config import _is_weekend, _get_holiday_info
 
-            df_hist = st.session_state['fc_data_26'].copy()
-            df_ref = st.session_state['fc_data_25'].copy()
+            # 优先用独立加载的去年同期数据
+            if 'hf_data_ly' in st.session_state and 'hf_data_lyy' in st.session_state:
+                df_hist_src = st.session_state['hf_data_ly']
+                df_ref_src = st.session_state['hf_data_lyy']
+            elif 'fc_data_26' in st.session_state and 'fc_data_25' in st.session_state:
+                df_hist_src = st.session_state['fc_data_26']
+                df_ref_src = st.session_state['fc_data_25']
+            else:
+                return None, None, None
+
+            df_hist = df_hist_src.copy()
+            df_ref = df_ref_src.copy()
 
             # 把历史数据转为 date→dau 字典
             dau_hist = {}
@@ -1625,15 +1714,14 @@ def _render_short_term_forecast():
             while d <= ly_end:
                 # 去年历史DAU
                 hist_dau = dau_hist.get(d)
-                # 前年参考DAU（用align_map对齐，或直接找前年同日期）
-                d_ref_candidate = align_map.get(d)
-                ref_dau = dau_ref.get(d_ref_candidate) if d_ref_candidate else None
-                if ref_dau is None:
-                    try:
-                        d_prev_year = d.replace(year=d.year - 1)
-                        ref_dau = dau_ref.get(d_prev_year)
-                    except ValueError:
-                        pass
+                # 前年参考DAU（直接用前一年同日期，假期本身就按自然日对齐）
+                try:
+                    d_prev_year = d.replace(year=d.year - 1)
+                    ref_dau = dau_ref.get(d_prev_year)
+                except ValueError:
+                    # 2月29日特殊处理
+                    d_prev_year = d.replace(year=d.year - 1, day=28)
+                    ref_dau = dau_ref.get(d_prev_year)
 
                 if hist_dau and ref_dau and ref_dau > 0:
                     yoy = (hist_dau / ref_dau - 1) * 100
@@ -1649,7 +1737,7 @@ def _render_short_term_forecast():
             sample_n = len(wd_yoys) + len(we_yoys)
             return wd_avg, we_avg, sample_n
 
-        has_hist_data = 'fc_data_26' in st.session_state
+        has_hist_data = ('hf_data_ly' in st.session_state) or ('fc_data_26' in st.session_state)
 
         hf_list = st.session_state['fc_holiday_factors']
         for i, hf in enumerate(hf_list):
@@ -1666,14 +1754,23 @@ def _render_short_term_forecast():
                     hf_list[i]['end'] = st.date_input(
                         "截止", value=hf['end'], key=f"hf_end_{i}")
 
+                # 自动计算结果在渲染 number_input 前写入 widget key
+                _pending_key = f'hf_pending_{i}'
+                if _pending_key in st.session_state:
+                    _pending = st.session_state.pop(_pending_key)
+                    st.session_state[f'hf_wd_{i}'] = _pending['wd']
+                    st.session_state[f'hf_we_{i}'] = _pending['we']
+                    hf_list[i]['weekday_yoy'] = _pending['wd']
+                    hf_list[i]['weekend_yoy'] = _pending['we']
+
                 hc4, hc5, hc6, hc7 = st.columns([1.5, 1.5, 2, 1])
                 with hc4:
                     hf_list[i]['weekday_yoy'] = st.number_input(
-                        "工作日YoY%", value=hf['weekday_yoy'], step=1.0, format="%.1f",
+                        "工作日YoY%", value=hf_list[i]['weekday_yoy'], step=1.0, format="%.1f",
                         key=f"hf_wd_{i}")
                 with hc5:
                     hf_list[i]['weekend_yoy'] = st.number_input(
-                        "周末YoY%", value=hf['weekend_yoy'], step=1.0, format="%.1f",
+                        "周末YoY%", value=hf_list[i]['weekend_yoy'], step=1.0, format="%.1f",
                         key=f"hf_we_{i}")
                 with hc6:
                     if has_hist_data:
@@ -1681,8 +1778,9 @@ def _render_short_term_forecast():
                             wd_auto, we_auto, n = _auto_calc_hf_yoy(
                                 hf_list[i]['start'], hf_list[i]['end'])
                             if wd_auto is not None:
-                                hf_list[i]['weekday_yoy'] = wd_auto
-                                hf_list[i]['weekend_yoy'] = we_auto if we_auto is not None else wd_auto
+                                we_val = we_auto if we_auto is not None else wd_auto
+                                # 存入 pending，下次 rerun 渲染 number_input 前应用
+                                st.session_state[_pending_key] = {'wd': wd_auto, 'we': we_val}
                                 st.session_state[f'hf_auto_result_{i}'] = (wd_auto, we_auto, n)
                                 st.rerun()
                             else:
