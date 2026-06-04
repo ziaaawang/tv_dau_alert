@@ -1315,8 +1315,86 @@ GROUP BY 1
 """
 
 
-def _get_holiday_factor(d, holiday_factors):
-    """查询某天是否命中假期因子，返回 (yoy_rate, factor_name) 或 None"""
+def build_holiday_yoy_curve(df_ly, df_lyy, baseline_start, baseline_end, curve_start, curve_end):
+    """计算去年 YoY 曲线及相对基准的提升量。
+    df_ly:  去年日DAU数据（date→dau）
+    df_lyy: 前年日DAU数据（date→dau）
+    baseline_start/end: 基准期（算正常工作日/周末基准YoY）
+    curve_start/end:    曲线期（算每天实际YoY和提升量）
+    返回: dict {date: {'yoy': float, 'delta': float, 'is_weekend': bool}}
+    """
+    from calendar_config import _is_weekend, _get_holiday_info
+
+    dau_ly = {}
+    for _, row in df_ly.iterrows():
+        d = row['log_date']
+        if isinstance(d, str):
+            d = datetime.strptime(d, '%Y%m%d').date()
+        dau_ly[d] = float(row['dau'])
+
+    dau_lyy = {}
+    for _, row in df_lyy.iterrows():
+        d = row['log_date']
+        if isinstance(d, str):
+            d = datetime.strptime(d, '%Y%m%d').date()
+        dau_lyy[d] = float(row['dau'])
+
+    # 构建去年日期（基准期+曲线期）的 align_map（按节假日和工作/休假性质对齐）
+    all_ly_dates = []
+    d = baseline_start
+    while d <= curve_end:
+        all_ly_dates.append(d)
+        d += timedelta(days=1)
+    ly_align_map = build_align_map(all_ly_dates)
+
+    def _yoy(d):
+        ref = ly_align_map.get(d)
+        if not ref:
+            return None
+        ly = dau_ly.get(d)
+        lyy = dau_lyy.get(ref)
+        if ly and lyy and lyy > 0:
+            return (ly / lyy - 1) * 100
+        return None
+
+    # 基准期：分工作日/周末算均值，同时记录每日数据用于展示
+    wd_base, we_base = [], []
+    baseline_daily = {}
+    d = baseline_start
+    while d <= baseline_end:
+        yoy = _yoy(d)
+        is_wknd = _is_weekend(d) or bool(_get_holiday_info(d, d.year))
+        if yoy is not None:
+            if is_wknd:
+                we_base.append(yoy)
+            else:
+                wd_base.append(yoy)
+            baseline_daily[d] = {'yoy': round(yoy, 2), 'is_weekend': is_wknd}
+        d += timedelta(days=1)
+
+    wd_avg = sum(wd_base) / len(wd_base) if wd_base else 0.0
+    we_avg = sum(we_base) / len(we_base) if we_base else 0.0
+
+    # 曲线期：每天实际 YoY 及相对基准的 delta
+    curve = {}
+    d = curve_start
+    while d <= curve_end:
+        yoy = _yoy(d)
+        is_wknd = _is_weekend(d) or bool(_get_holiday_info(d, d.year))
+        base = we_avg if is_wknd else wd_avg
+        if yoy is not None:
+            curve[d] = {'yoy': round(yoy, 2), 'delta': round(yoy - base, 2), 'is_weekend': is_wknd}
+        else:
+            curve[d] = {'yoy': None, 'delta': 0.0, 'is_weekend': is_wknd}
+        d += timedelta(days=1)
+
+    return curve, wd_avg, we_avg, baseline_daily
+
+
+def _get_holiday_factor(d, holiday_factors, yoy_curve_map=None, base_weekday_yoy=0.0, base_weekend_yoy=0.0):
+    """查询某天是否命中假期因子，返回 (yoy_rate, factor_name) 或 None。
+    yoy_curve_map: {今年日期: 去年同日期} 偏移映射（用于曲线模式）
+    """
     if not holiday_factors:
         return None
     from calendar_config import _is_weekend, _get_holiday_info
@@ -1325,6 +1403,21 @@ def _get_holiday_factor(d, holiday_factors):
         if not hf.get('enabled', True):
             continue
         if hf['start'] <= d <= hf['end']:
+            # 曲线模式
+            if hf.get('mode') == 'curve' and yoy_curve_map:
+                curve = yoy_curve_map.get(hf['name'], {})
+                # 找去年对应日期（同月同日）
+                try:
+                    d_ly = d.replace(year=d.year - 1)
+                except ValueError:
+                    d_ly = d.replace(year=d.year - 1, day=28)
+                entry = curve.get(d_ly)
+                if entry and entry['yoy'] is not None:
+                    # 今年基准 + 去年相对提升量
+                    base = base_weekend_yoy if is_wknd else base_weekday_yoy
+                    yoy_rate = base + entry['delta']
+                    return yoy_rate, hf['name']
+                # 曲线无数据则回退到固定值
             key = 'weekend_yoy' if is_wknd else 'weekday_yoy'
             return hf[key], hf['name']
     return None
@@ -1333,7 +1426,8 @@ def _get_holiday_factor(d, holiday_factors):
 def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14, yoy_overrides=None,
                            manual_weekday_yoy=None, manual_weekend_yoy=None,
                            weekday_slope=0.0, weekend_slope=0.0,
-                           src_year=2026, holiday_factors=None):
+                           src_year=2026, holiday_factors=None, yoy_curve_map=None,
+                           ref_date_start=None, ref_date_end=None):
     """天级DAU预估，src_year控制列名动态生成"""
     import io
     from calendar_config import _is_weekend
@@ -1372,7 +1466,12 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
         })
 
     # 计算近N天的 weekday/weekend 平均YoY
-    recent = [r for r in hist_records[-ref_days:] if r['YoY%'] is not None]
+    # 按自定义日期区间或最近N天计算基准YoY
+    if ref_date_start and ref_date_end:
+        recent = [r for r in hist_records
+                  if r['YoY%'] is not None and ref_date_start <= r['日期'] <= ref_date_end]
+    else:
+        recent = [r for r in hist_records[-ref_days:] if r['YoY%'] is not None]
     weekday_yoys = [r['YoY%'] for r in recent if not r['is_weekend']]
     weekend_yoys = [r['YoY%'] for r in recent if r['is_weekend']]
 
@@ -1405,7 +1504,10 @@ def compute_daily_forecast(df_26, df_25, align_map, forecast_dates, ref_days=14,
             data_type = '预估(调整)'
         else:
             # 优先级2：假期因子
-            hf_hit = _get_holiday_factor(d26, holiday_factors)
+            hf_hit = _get_holiday_factor(d26, holiday_factors,
+                                         yoy_curve_map=yoy_curve_map,
+                                         base_weekday_yoy=weekday_avg_yoy,
+                                         base_weekend_yoy=weekend_avg_yoy)
             if hf_hit:
                 yoy_rate = hf_hit[0]
                 data_type = f'预估({hf_hit[1]})'
@@ -1510,8 +1612,14 @@ def _render_short_term_forecast():
         fc_end = st.date_input("预测截止日",
             value=saved.get('fc_end', today + timedelta(days=30)), key="fc_end")
 
-    ref_days = st.slider("YoY参考天数（取最近N天均值）", 7, 30,
-        value=saved.get('ref_days', 14), key="fc_ref_days")
+    ref_col1, ref_col2 = st.columns(2)
+    with ref_col1:
+        ref_start_default = saved.get('ref_start', today - timedelta(days=14))
+        ref_yoy_start = st.date_input("YoY基准期 起始", value=ref_start_default, key="fc_ref_start")
+    with ref_col2:
+        ref_end_default = saved.get('ref_end', today - timedelta(days=1))
+        ref_yoy_end = st.date_input("YoY基准期 截止", value=ref_end_default, key="fc_ref_end")
+    ref_days = max((ref_yoy_end - ref_yoy_start).days + 1, 1)  # 保留兼容，供其他地方展示天数用
 
     src_year = hist_start.year
     ref_year = src_year - 1
@@ -1738,12 +1846,33 @@ def _render_short_term_forecast():
             return wd_avg, we_avg, sample_n
 
         has_hist_data = ('hf_data_ly' in st.session_state) or ('fc_data_26' in st.session_state)
+        has_curve_data = 'hf_data_ly' in st.session_state and 'hf_data_lyy' in st.session_state
+
+        # 构建曲线缓存（按假期名存）
+        if 'hf_yoy_curves' not in st.session_state:
+            st.session_state['hf_yoy_curves'] = {}
 
         hf_list = st.session_state['fc_holiday_factors']
         for i, hf in enumerate(hf_list):
-            with st.container():
-                st.markdown(f"**{hf['name']}**")
-                hc1, hc2, hc3 = st.columns([1, 2, 2])
+            with st.expander(f"{'✅' if hf.get('enabled', True) else '⬜'} {hf['name']}", expanded=False):
+                hc_name, hc_del = st.columns([9, 1])
+                with hc_name:
+                    new_name = st.text_input("假期名称", value=hf['name'], key=f"hf_name_{i}",
+                                             label_visibility="collapsed")
+                    if new_name and new_name != hf['name']:
+                        curves = st.session_state.get('hf_yoy_curves', {})
+                        if hf['name'] in curves:
+                            curves[new_name] = curves.pop(hf['name'])
+                        hf_list[i]['name'] = new_name
+                        st.rerun()
+                with hc_del:
+                    if st.button("🗑", key=f"del_hf_{i}"):
+                        st.session_state['fc_holiday_factors'].pop(i)
+                        st.session_state.pop(f'hf_auto_result_{i}', None)
+                        st.session_state['hf_yoy_curves'].pop(hf['name'], None)
+                        st.rerun()
+
+                hc1, hc2, hc3, hc_mode = st.columns([1, 2, 2, 2])
                 with hc1:
                     enabled = st.checkbox("启用", value=hf['enabled'], key=f"hf_enabled_{i}")
                     hf_list[i]['enabled'] = enabled
@@ -1753,83 +1882,336 @@ def _render_short_term_forecast():
                 with hc3:
                     hf_list[i]['end'] = st.date_input(
                         "截止", value=hf['end'], key=f"hf_end_{i}")
+                # mode pending：在 radio 渲染前写入，避免 widget 已实例化后修改 key 报错
+                _mode_pending_key = f'hf_mode_pending_{i}'
+                if _mode_pending_key in st.session_state:
+                    st.session_state[f'hf_mode_{i}'] = st.session_state.pop(_mode_pending_key)
 
-                # 自动计算结果在渲染 number_input 前写入 widget key
-                _pending_key = f'hf_pending_{i}'
-                if _pending_key in st.session_state:
-                    _pending = st.session_state.pop(_pending_key)
-                    st.session_state[f'hf_wd_{i}'] = _pending['wd']
-                    st.session_state[f'hf_we_{i}'] = _pending['we']
-                    hf_list[i]['weekday_yoy'] = _pending['wd']
-                    hf_list[i]['weekend_yoy'] = _pending['we']
+                with hc_mode:
+                    mode = st.radio("预估模式", ["固定YoY", "曲线模式（跟随去年YoY趋势）"],
+                                    index=0 if hf.get('mode', 'fixed') == 'fixed' else 1,
+                                    key=f"hf_mode_{i}", horizontal=True)
+                    hf_list[i]['mode'] = 'fixed' if mode == "固定YoY" else 'curve'
 
-                hc4, hc5, hc6, hc7 = st.columns([1.5, 1.5, 2, 1])
-                with hc4:
-                    hf_list[i]['weekday_yoy'] = st.number_input(
-                        "工作日YoY%", value=hf_list[i]['weekday_yoy'], step=1.0, format="%.1f",
-                        key=f"hf_wd_{i}")
-                with hc5:
-                    hf_list[i]['weekend_yoy'] = st.number_input(
-                        "周末YoY%", value=hf_list[i]['weekend_yoy'], step=1.0, format="%.1f",
-                        key=f"hf_we_{i}")
-                with hc6:
-                    if has_hist_data:
-                        if st.button(f"📊 自动计算（参考去年同期）", key=f"hf_auto_{i}"):
-                            wd_auto, we_auto, n = _auto_calc_hf_yoy(
-                                hf_list[i]['start'], hf_list[i]['end'])
-                            if wd_auto is not None:
-                                we_val = we_auto if we_auto is not None else wd_auto
-                                # 存入 pending，下次 rerun 渲染 number_input 前应用
-                                st.session_state[_pending_key] = {'wd': wd_auto, 'we': we_val}
-                                st.session_state[f'hf_auto_result_{i}'] = (wd_auto, we_auto, n)
-                                st.rerun()
-                            else:
-                                st.warning("历史数据中未找到去年同期数据，请先加载更长区间的历史数据")
-                    else:
-                        st.caption("先运行预估加载历史数据，再自动计算")
-                with hc7:
-                    if st.button("🗑", key=f"del_hf_{i}"):
-                        st.session_state['fc_holiday_factors'].pop(i)
-                        st.session_state.pop(f'hf_auto_result_{i}', None)
-                        st.rerun()
+                if hf_list[i]['mode'] == 'fixed':
+                    # ── 固定YoY模式 ──
+                    _pending_key = f'hf_pending_{i}'
+                    if _pending_key in st.session_state:
+                        _pending = st.session_state.pop(_pending_key)
+                        st.session_state[f'hf_wd_{i}'] = _pending['wd']
+                        st.session_state[f'hf_we_{i}'] = _pending['we']
+                        hf_list[i]['weekday_yoy'] = _pending['wd']
+                        hf_list[i]['weekend_yoy'] = _pending['we']
 
-                # 显示自动计算结果说明
-                if f'hf_auto_result_{i}' in st.session_state:
-                    wd_r, we_r, n_r = st.session_state[f'hf_auto_result_{i}']
+                    hc4, hc5, hc6 = st.columns([1.5, 1.5, 2])
+                    with hc4:
+                        hf_list[i]['weekday_yoy'] = st.number_input(
+                            "工作日YoY%", value=hf_list[i]['weekday_yoy'], step=1.0, format="%.1f",
+                            key=f"hf_wd_{i}")
+                    with hc5:
+                        hf_list[i]['weekend_yoy'] = st.number_input(
+                            "周末YoY%", value=hf_list[i]['weekend_yoy'], step=1.0, format="%.1f",
+                            key=f"hf_we_{i}")
+                    with hc6:
+                        if has_hist_data:
+                            if st.button(f"📊 自动计算（参考去年同期均值）", key=f"hf_auto_{i}"):
+                                wd_auto, we_auto, n = _auto_calc_hf_yoy(
+                                    hf_list[i]['start'], hf_list[i]['end'])
+                                if wd_auto is not None:
+                                    we_val = we_auto if we_auto is not None else wd_auto
+                                    st.session_state[_pending_key] = {'wd': wd_auto, 'we': we_val}
+                                    st.session_state[f'hf_auto_result_{i}'] = (wd_auto, we_auto, n)
+                                    st.rerun()
+                                else:
+                                    st.warning("历史数据中未找到去年同期数据，请先加载")
+                        else:
+                            st.caption("先加载去年同期数据，再自动计算")
+
+                    if f'hf_auto_result_{i}' in st.session_state:
+                        wd_r, we_r, n_r = st.session_state[f'hf_auto_result_{i}']
+                        last_year = hf_list[i]['start'].year - 1
+                        st.caption(
+                            f"参考去年同期（{last_year}年）实际YoY — "
+                            f"工作日均值 **{wd_r:+.1f}%**，周末均值 **{we_r:+.1f}%**（样本{n_r}天）")
+
+                else:
+                    # ── 曲线模式 ──
+                    st.caption("根据去年同期YoY日曲线的趋势变化预估今年。基准期算正常YoY，曲线期记录每日偏差，今年预估 = 今年基准YoY + 去年同日偏差。")
                     last_year = hf_list[i]['start'].year - 1
-                    st.caption(
-                        f"📊 参考去年同期（{last_year}年）实际YoY — "
-                        f"工作日均值 **{wd_r:+.1f}%**，周末均值 **{we_r:+.1f}%**（样本{n_r}天），可在上方手动微调")
 
-                st.markdown("---")
+                    cv1, cv2, cv3, cv4 = st.columns([2, 2, 2, 2])
+                    with cv1:
+                        default_base_s = date(last_year, max(1, hf_list[i]['start'].month - 2), 1)
+                        default_base_e = hf_list[i]['start'].replace(year=last_year) - timedelta(days=14)
+                        curve_base_start = st.date_input("基准期 起始（去年）",
+                            value=st.session_state.get(f'hf_cv_bs_{i}', default_base_s),
+                            key=f"hf_cv_bs_{i}")
+                    with cv2:
+                        curve_base_end = st.date_input("基准期 截止（去年）",
+                            value=st.session_state.get(f'hf_cv_be_{i}', default_base_e),
+                            key=f"hf_cv_be_{i}")
+                    with cv3:
+                        default_curve_s = hf_list[i]['start'].replace(year=last_year) - timedelta(days=14)
+                        curve_start_ly = st.date_input("曲线期 起始（去年）",
+                            value=st.session_state.get(f'hf_cv_cs_{i}', default_curve_s),
+                            key=f"hf_cv_cs_{i}")
+                    with cv4:
+                        default_curve_e = hf_list[i]['end'].replace(year=last_year)
+                        curve_end_ly = st.date_input("曲线期 截止（去年）",
+                            value=st.session_state.get(f'hf_cv_ce_{i}', default_curve_e),
+                            key=f"hf_cv_ce_{i}")
+
+                    if has_curve_data:
+                        if st.button(f"📈 计算去年YoY曲线", key=f"hf_calc_curve_{i}"):
+                            curve, wd_base, we_base, baseline_daily = build_holiday_yoy_curve(
+                                st.session_state['hf_data_ly'],
+                                st.session_state['hf_data_lyy'],
+                                curve_base_start, curve_base_end,
+                                curve_start_ly, curve_end_ly)
+                            st.session_state['hf_yoy_curves'][hf['name']] = curve
+                            st.session_state[f'hf_curve_base_{i}'] = (wd_base, we_base)
+                            st.session_state[f'hf_baseline_daily_{i}'] = baseline_daily
+                            # 清掉调整框的 widget key，让下次渲染用新算出的均值重新初始化
+                            st.session_state.pop(f'hf_curve_adj_wd_{i}', None)
+                            st.session_state.pop(f'hf_curve_adj_we_{i}', None)
+                            st.rerun()
+
+                        # 展示曲线预览图（基准期 + 曲线期连续展示）
+                        if hf['name'] in st.session_state['hf_yoy_curves']:
+                            import plotly.graph_objects as go
+                            curve = st.session_state['hf_yoy_curves'][hf['name']]
+                            baseline_daily = st.session_state.get(f'hf_baseline_daily_{i}', {})
+                            wd_base_v, we_base_v = st.session_state.get(f'hf_curve_base_{i}', (0, 0))
+
+                            # 基准期数据
+                            dates_b = sorted(baseline_daily.keys())
+                            yoys_b = [baseline_daily[d]['yoy'] for d in dates_b]
+                            colors_b = ['rgba(231,139,139,0.4)' if baseline_daily[d]['is_weekend']
+                                        else 'rgba(123,158,224,0.4)' for d in dates_b]
+
+                            # 曲线期数据
+                            dates_c = sorted(curve.keys())
+                            yoys_c = [curve[d]['yoy'] for d in dates_c]
+                            deltas_c = [curve[d]['delta'] for d in dates_c]
+                            colors_c = ['#e07b7b' if curve[d]['is_weekend'] else '#7b9ee0' for d in dates_c]
+
+                            fig_c = go.Figure()
+
+                            # 基准期柱（半透明，区分）
+                            fig_c.add_trace(go.Bar(
+                                x=dates_b, y=yoys_b, name='基准期YoY%',
+                                marker_color=colors_b,
+                                hovertemplate='%{x}（基准期）<br>YoY: %{y:.1f}%<extra></extra>'))
+
+                            # 曲线期柱（实色）
+                            fig_c.add_trace(go.Bar(
+                                x=dates_c, y=yoys_c, name='曲线期YoY%',
+                                marker_color=colors_c, opacity=0.85,
+                                hovertemplate='%{x}（曲线期）<br>YoY: %{y:.1f}%<extra></extra>'))
+
+                            # 基准线：用 shape+annotation 分开标注，避免重叠
+                            fig_c.add_shape(type='line', x0=0, x1=1, xref='paper',
+                                            y0=wd_base_v, y1=wd_base_v,
+                                            line=dict(dash='dash', color='#7b9ee0', width=1.5))
+                            wd_anchor = 'bottom' if wd_base_v >= we_base_v else 'top'
+                            wd_shift = 4 if wd_base_v >= we_base_v else -4
+                            we_anchor = 'bottom' if we_base_v >= wd_base_v else 'top'
+                            we_shift = 4 if we_base_v >= wd_base_v else -4
+                            fig_c.add_annotation(x=0.01, xref='paper', y=wd_base_v,
+                                                 text=f'工作日基准 {wd_base_v:+.1f}%',
+                                                 showarrow=False, xanchor='left', yanchor=wd_anchor,
+                                                 yshift=wd_shift, font=dict(size=11, color='#7b9ee0'))
+                            fig_c.add_shape(type='line', x0=0, x1=1, xref='paper',
+                                            y0=we_base_v, y1=we_base_v,
+                                            line=dict(dash='dash', color='#e07b7b', width=1.5))
+                            fig_c.add_annotation(x=0.01, xref='paper', y=we_base_v,
+                                                 text=f'周末基准 {we_base_v:+.1f}%',
+                                                 showarrow=False, xanchor='left', yanchor=we_anchor,
+                                                 yshift=we_shift, font=dict(size=11, color='#e07b7b'))
+
+                            # 曲线期偏差折线
+                            fig_c.add_trace(go.Scatter(
+                                x=dates_c, y=deltas_c, name='曲线期偏差(delta)',
+                                mode='lines+markers', marker=dict(size=4),
+                                line=dict(color='orange', width=2),
+                                hovertemplate='%{x}<br>delta: %{y:+.1f}pp<extra></extra>'))
+
+                            # 基准期/曲线期分割线
+                            if dates_b and dates_c:
+                                split_x = str(dates_c[0])
+                                fig_c.add_shape(type='line',
+                                                x0=split_x, x1=split_x, y0=0, y1=1,
+                                                xref='x', yref='paper',
+                                                line=dict(dash='dot', color='gray', width=1))
+                                fig_c.add_annotation(x=split_x, y=1, yref='paper',
+                                                     text='曲线期开始', showarrow=False,
+                                                     xanchor='left', yanchor='top',
+                                                     font=dict(size=11, color='gray'))
+
+                            fig_c.update_layout(
+                                title=f"{hf['name']} — 去年YoY日曲线（浅色=基准期，深色=曲线期，橙线=偏差）",
+                                barmode='overlay',
+                                height=320, margin=dict(t=50, b=20),
+                                legend=dict(orientation='h', y=-0.2))
+                            st.plotly_chart(fig_c, use_container_width=True)
+                            st.caption(
+                                f"蓝=工作日 / 红=周末。工作日基准 **{wd_base_v:+.1f}%**，周末基准 **{we_base_v:+.1f}%**。"
+                                f"今年预估 = 今年最近{ref_days}天基准YoY + 橙线偏差。")
+
+                            # ── 今年假期预估YoY明细 ──
+                            st.markdown("##### 今年假期预估YoY明细")
+
+                            # 计算今年基准YoY（从主预估历史数据取最近N天）
+                            this_year_base_wd, this_year_base_we = None, None
+                            if 'fc_data_26' in st.session_state and 'fc_data_25' in st.session_state:
+                                from calendar_config import _is_weekend as _iswe, _get_holiday_info as _ghi
+                                df_h26 = st.session_state['fc_data_26']
+                                df_h25 = st.session_state['fc_data_25']
+                                _dau26 = {}
+                                for _, r in df_h26.iterrows():
+                                    _d = r['log_date']
+                                    if isinstance(_d, str):
+                                        _d = datetime.strptime(_d, '%Y%m%d').date()
+                                    _dau26[_d] = float(r['dau'])
+                                _dau25 = {}
+                                for _, r in df_h25.iterrows():
+                                    _d = r['log_date']
+                                    if isinstance(_d, str):
+                                        _d = datetime.strptime(_d, '%Y%m%d').date()
+                                    _dau25[_d] = float(r['dau'])
+                                _hist_dates = sorted(_dau26.keys())
+                                _recent = [d for d in _hist_dates if ref_yoy_start <= d <= ref_yoy_end] or \
+                                          _hist_dates[-ref_days:]
+                                _hist_align = build_align_map(_recent)
+                                _wd_yoys, _we_yoys = [], []
+                                for _d in _recent:
+                                    _ref = _hist_align.get(_d)
+                                    _v26 = _dau26.get(_d)
+                                    _v25 = _dau25.get(_ref) if _ref else None
+                                    if _v26 and _v25 and _v25 > 0:
+                                        _yoy = (_v26 / _v25 - 1) * 100
+                                        if _iswe(_d) or bool(_ghi(_d, _d.year)):
+                                            _we_yoys.append(_yoy)
+                                        else:
+                                            _wd_yoys.append(_yoy)
+                                this_year_base_wd = round(sum(_wd_yoys) / len(_wd_yoys), 1) if _wd_yoys else None
+                                this_year_base_we = round(sum(_we_yoys) / len(_we_yoys), 1) if _we_yoys else None
+
+                            if this_year_base_wd is None:
+                                st.warning("请先「运行预估」加载今年历史数据，才能计算今年基准YoY")
+                            else:
+                                st.caption(f"今年基准YoY（最近{ref_days}天实际均值）：工作日 **{this_year_base_wd:+.1f}%**，周末 **{this_year_base_we:+.1f}%**")
+
+                                # 逐日计算，汇总为工作日/周末/整体均值
+                                from calendar_config import _is_weekend as _iswe2, _get_holiday_info as _ghi2
+                                _wd_est, _we_est, _all_est = [], [], []
+                                _d = hf_list[i]['start']
+                                while _d <= hf_list[i]['end']:
+                                    _is_wknd = _iswe2(_d) or bool(_ghi2(_d, _d.year))
+                                    _base = this_year_base_we if _is_wknd else this_year_base_wd
+                                    try:
+                                        _d_ly = _d.replace(year=_d.year - 1)
+                                    except ValueError:
+                                        _d_ly = _d.replace(year=_d.year - 1, day=28)
+                                    _entry = curve.get(_d_ly)
+                                    _est_yoy = round(_base + _entry['delta'], 1) if (_entry and _entry['yoy'] is not None) else _base
+                                    _all_est.append(_est_yoy)
+                                    if _is_wknd:
+                                        _we_est.append(_est_yoy)
+                                    else:
+                                        _wd_est.append(_est_yoy)
+                                    _d += timedelta(days=1)
+
+                                _total_days = len(_all_est)
+                                _wd_days = len(_wd_est)
+                                _we_days = len(_we_est)
+                                _avg_all = round(sum(_all_est) / _total_days, 1) if _all_est else None
+                                _avg_wd  = round(sum(_wd_est) / _wd_days, 1) if _wd_est else None
+                                _avg_we  = round(sum(_we_est) / _we_days, 1) if _we_est else None
+
+                                summary_df = pd.DataFrame([
+                                    {'类型': '工作日', '天数': _wd_days, '预估日均YoY%': _avg_wd,
+                                     '基准YoY%': this_year_base_wd,
+                                     'delta均值pp': round(_avg_wd - this_year_base_wd, 1) if _avg_wd is not None else None},
+                                    {'类型': '周末/假日', '天数': _we_days, '预估日均YoY%': _avg_we,
+                                     '基准YoY%': this_year_base_we,
+                                     'delta均值pp': round(_avg_we - this_year_base_we, 1) if _avg_we is not None else None},
+                                    {'类型': '整体', '天数': _total_days, '预估日均YoY%': _avg_all,
+                                     '基准YoY%': None, 'delta均值pp': None},
+                                ])
+                                styled = summary_df.style.format({
+                                    '预估日均YoY%': '{:+.1f}', '基准YoY%': '{:+.1f}', 'delta均值pp': '{:+.1f}'
+                                }, na_rep='-').hide(axis='index')
+                                render_styled_df(styled)
+
+                                # ── 应用并调整 ──
+                                st.markdown("**调整后应用**")
+                                st.caption("曲线模式下预估使用逐日delta，也可在此输入固定YoY覆盖整个假期区间（切回固定YoY模式同效果）")
+                                _adj_pending = f'hf_pending_{i}'
+                                _adj1, _adj2, _adj3 = st.columns([1.5, 1.5, 2])
+                                with _adj1:
+                                    _adj_wd = st.number_input(
+                                        "工作日YoY%（可调）",
+                                        value=float(_avg_wd) if _avg_wd is not None else float(this_year_base_wd),
+                                        step=1.0, format="%.1f", key=f"hf_curve_adj_wd_{i}")
+                                with _adj2:
+                                    _adj_we = st.number_input(
+                                        "周末YoY%（可调）",
+                                        value=float(_avg_we) if _avg_we is not None else float(this_year_base_we),
+                                        step=1.0, format="%.1f", key=f"hf_curve_adj_we_{i}")
+                                with _adj3:
+                                    st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+                                    if st.button("✅ 切换为固定YoY并应用", key=f"hf_curve_apply_{i}"):
+                                        hf_list[i]['mode'] = 'fixed'
+                                        hf_list[i]['weekday_yoy'] = _adj_wd
+                                        hf_list[i]['weekend_yoy'] = _adj_we
+                                        # 通过 pending 机制在下次渲染前写入 widget key
+                                        st.session_state[f'hf_pending_{i}'] = {'wd': _adj_wd, 'we': _adj_we}
+                                        st.session_state[f'hf_mode_pending_{i}'] = "固定YoY"
+                                        st.rerun()
+                        else:
+                            st.info("点击「计算去年YoY曲线」预览去年趋势并应用到今年预估")
+                    else:
+                        st.warning("请先点击上方「加载去年同期数据」")
 
         # 新增自定义假期
-        st.markdown("**添加自定义假期**")
-        nc1, nc2, nc3, nc4, nc5 = st.columns([2, 2, 2, 1.5, 1.5])
-        with nc1:
-            new_hf_name = st.text_input("假期名称", value="", placeholder="如：秋假", key="new_hf_name")
-        with nc2:
-            new_hf_start = st.date_input("起始", value=fc_start, key="new_hf_start")
-        with nc3:
-            new_hf_end = st.date_input("截止", value=fc_start, key="new_hf_end")
-        with nc4:
-            new_hf_wd = st.number_input("工作日YoY%", value=30.0, step=1.0, format="%.1f", key="new_hf_wd")
-        with nc5:
-            new_hf_we = st.number_input("周末YoY%", value=28.0, step=1.0, format="%.1f", key="new_hf_we")
+        with st.expander("➕ 添加自定义假期", expanded=False):
+            nc_name, nc_start, nc_end = st.columns([2, 2, 2])
+            with nc_name:
+                new_hf_name = st.text_input("假期名称", value="", placeholder="如：秋假", key="new_hf_name")
+            with nc_start:
+                new_hf_start = st.date_input("起始", value=fc_start, key="new_hf_start")
+            with nc_end:
+                new_hf_end = st.date_input("截止", value=fc_start, key="new_hf_end")
 
-        if st.button("➕ 添加假期因子", key="btn_add_hf"):
-            if new_hf_name and new_hf_start <= new_hf_end:
-                st.session_state['fc_holiday_factors'].append({
-                    'name': new_hf_name,
-                    'start': new_hf_start,
-                    'end': new_hf_end,
-                    'weekday_yoy': new_hf_wd,
-                    'weekend_yoy': new_hf_we,
-                    'enabled': True,
-                })
-                st.rerun()
-            else:
-                st.warning("请填写假期名称，且起始日不能晚于截止日")
+            nc_wd, nc_we, nc_mode = st.columns([1.5, 1.5, 3])
+            with nc_wd:
+                new_hf_wd = st.number_input("工作日YoY%", value=30.0, step=1.0, format="%.1f", key="new_hf_wd")
+            with nc_we:
+                new_hf_we = st.number_input("周末YoY%", value=28.0, step=1.0, format="%.1f", key="new_hf_we")
+            with nc_mode:
+                new_hf_mode_label = st.radio("预估模式", ["固定YoY", "曲线模式（跟随去年YoY趋势）"],
+                                             key="new_hf_mode", horizontal=True)
+                new_hf_mode = 'fixed' if new_hf_mode_label == "固定YoY" else 'curve'
+
+            if st.button("➕ 添加假期因子", key="btn_add_hf"):
+                if new_hf_name and new_hf_start <= new_hf_end:
+                    new_idx = len(st.session_state['fc_holiday_factors'])
+                    st.session_state['fc_holiday_factors'].append({
+                        'name': new_hf_name,
+                        'start': new_hf_start,
+                        'end': new_hf_end,
+                        'weekday_yoy': new_hf_wd,
+                        'weekend_yoy': new_hf_we,
+                        'enabled': True,
+                        'mode': new_hf_mode,
+                    })
+                    # 新假期 radio key 提前写入，确保 expander 展开时正确显示模式
+                    if new_hf_mode == 'curve':
+                        st.session_state[f'hf_mode_{new_idx}'] = "曲线模式（跟随去年YoY趋势）"
+                    st.rerun()
+                else:
+                    st.warning("请填写假期名称，且起始日不能晚于截止日")
 
     # 检查是否有已缓存的数据可直接展示
     has_data = 'fc_data_26' in st.session_state and 'fc_data_25' in st.session_state
@@ -1867,6 +2249,7 @@ def _render_short_term_forecast():
             st.session_state['fc_saved_params'] = {
                 'hist_start': hist_start, 'hist_end': hist_end,
                 'fc_start': fc_start, 'fc_end': fc_end, 'ref_days': ref_days,
+                'ref_start': ref_yoy_start, 'ref_end': ref_yoy_end,
             }
             st.session_state.pop('fc_wd_slope', None)
             st.session_state.pop('fc_we_slope', None)
@@ -1936,7 +2319,9 @@ def _render_short_term_forecast():
         yoy_overrides=st.session_state.get('fc_yoy_overrides'),
         weekday_slope=wd_slope, weekend_slope=we_slope,
         src_year=src_year,
-        holiday_factors=st.session_state.get('fc_holiday_factors'))
+        holiday_factors=st.session_state.get('fc_holiday_factors'),
+        yoy_curve_map=st.session_state.get('hf_yoy_curves'),
+        ref_date_start=ref_yoy_start, ref_date_end=ref_yoy_end)
 
     # 添加周对齐DAU
     dau_25_lookup = {}
@@ -1956,13 +2341,42 @@ def _render_short_term_forecast():
     m1, m2 = st.columns(2)
     wd_delta = f"{wd_slope:+.2f}pp/周" if wd_slope != 0 else None
     we_delta = f"{we_slope:+.2f}pp/周" if we_slope != 0 else None
-    m1.metric("周中平均YoY", f"{weekday_yoy:+.1f}%", delta=wd_delta)
-    m2.metric("周末平均YoY", f"{weekend_yoy:+.1f}%", delta=we_delta)
+    with m1:
+        ai_wd_yoy = st.number_input("周中平均YoY%（可调）", value=round(weekday_yoy, 1),
+                                    step=0.5, format="%.1f", key="ai_wd_yoy",
+                                    help=f"自动计算值：{weekday_yoy:+.1f}%{('，趋势' + wd_delta) if wd_delta else ''}")
+    with m2:
+        ai_we_yoy = st.number_input("周末平均YoY%（可调）", value=round(weekend_yoy, 1),
+                                    step=0.5, format="%.1f", key="ai_we_yoy",
+                                    help=f"自动计算值：{weekend_yoy:+.1f}%{('，趋势' + we_delta) if we_delta else ''}")
 
-    # 趋势图
+    # 若用户手动调整了，用调整值重新预估
+    if ai_wd_yoy != round(weekday_yoy, 1) or ai_we_yoy != round(weekend_yoy, 1):
+        result_df, _, _ = compute_daily_forecast(
+            df_26, df_25, align_map, forecast_dates, ref_days,
+            yoy_overrides=st.session_state.get('fc_yoy_overrides'),
+            manual_weekday_yoy=ai_wd_yoy, manual_weekend_yoy=ai_we_yoy,
+            weekday_slope=wd_slope, weekend_slope=we_slope,
+            src_year=src_year,
+            holiday_factors=st.session_state.get('fc_holiday_factors'),
+            yoy_curve_map=st.session_state.get('hf_yoy_curves'),
+            ref_date_start=ref_yoy_start, ref_date_end=ref_yoy_end)
+        result_df[col_ref_week_date] = result_df['日期'].map(week_align_map)
+        result_df[col_ref_week_dau] = result_df[col_ref_week_date].map(
+            lambda d: dau_25_lookup.get(d, 0) if d else 0)
+        fc_part = result_df[result_df['数据类型'] != '实际'].copy()
+        fc_adj_part = result_df[result_df['数据类型'] == '预估(调整)'].copy()
+
+    # 趋势图（若用户未手动调整AI YoY，在此初始化 fc_part/fc_adj_part）
     hist_part = result_df[result_df['数据类型'] == '实际'].copy()
-    fc_part = result_df[result_df['数据类型'] == '预估'].copy()
-    fc_adj_part = result_df[result_df['数据类型'] == '预估(调整)'].copy()
+    try:
+        fc_part
+    except NameError:
+        fc_part = result_df[result_df['数据类型'] != '实际'].copy()
+    try:
+        fc_adj_part
+    except NameError:
+        fc_adj_part = result_df[result_df['数据类型'] == '预估(调整)'].copy()
 
     dau_hover = '%{y:.0f}万'
     fig = go.Figure()
@@ -1971,6 +2385,18 @@ def _render_short_term_forecast():
         mode='lines', name=f'{sy}年实际', line=dict(width=2, color='#1f77b4'),
         hovertemplate='%{x}<br>' + f'{sy}年实际: ' + dau_hover + '<extra></extra>'))
     fc_combined = pd.concat([fc_part, fc_adj_part]).sort_values('日期')
+
+    # 历史最后一点→预估第一点的连接线
+    if not hist_part.empty and not fc_combined.empty:
+        last_hist = hist_part.iloc[-1]
+        first_fc = fc_combined.iloc[0]
+        fig.add_trace(go.Scatter(
+            x=[last_hist['日期'], first_fc['日期']],
+            y=[(last_hist[col_src_dau] / 1e4).round(0), (first_fc[col_src_dau] / 1e4).round(0)],
+            mode='lines', name='', showlegend=False,
+            line=dict(width=2, dash='dash', color='red'),
+            hoverinfo='skip'))
+
     if not fc_combined.empty:
         fig.add_trace(go.Scatter(
             x=fc_combined['日期'], y=(fc_combined[col_src_dau] / 1e4).round(0),
@@ -2042,7 +2468,6 @@ def _render_short_term_forecast():
 
     # ── 人工预估结果 ──
     st.markdown("---")
-    st.markdown("#### 人工预估结果")
 
     mc1, mc2 = st.columns(2)
     with mc1:
@@ -2056,67 +2481,69 @@ def _render_short_term_forecast():
         manual_weekday_yoy=manual_wd_yoy, manual_weekend_yoy=manual_we_yoy,
         weekday_slope=wd_slope, weekend_slope=we_slope,
         src_year=src_year,
-        holiday_factors=st.session_state.get('fc_holiday_factors'))
+        holiday_factors=st.session_state.get('fc_holiday_factors'),
+        yoy_curve_map=st.session_state.get('hf_yoy_curves'),
+        ref_date_start=ref_yoy_start, ref_date_end=ref_yoy_end)
     manual_result_df[col_ref_week_date] = manual_result_df['日期'].map(week_align_map)
     manual_result_df[col_ref_week_dau] = manual_result_df[col_ref_week_date].map(
         lambda d: dau_25_lookup.get(d, 0) if d else 0)
 
-    m_hist = manual_result_df[manual_result_df['数据类型'] == '实际'].copy()
-    m_fc = manual_result_df[manual_result_df['数据类型'].isin(['预估', '预估(调整)'])].copy().sort_values('日期')
-    m_fc_adj = manual_result_df[manual_result_df['数据类型'] == '预估(调整)'].copy()
+    st.markdown("#### 人工预估结果")
+    with st.expander("点击展开人工预估", expanded=False):
+        m_hist = manual_result_df[manual_result_df['数据类型'] == '实际'].copy()
+        m_fc = manual_result_df[manual_result_df['数据类型'].isin(['预估', '预估(调整)'])].copy().sort_values('日期')
+        m_fc_adj = manual_result_df[manual_result_df['数据类型'] == '预估(调整)'].copy()
 
-    fig_m = go.Figure()
-    fig_m.add_trace(go.Scatter(
-        x=m_hist['日期'], y=(m_hist[col_src_dau] / 1e4).round(0),
-        mode='lines', name=f'{sy}年实际', line=dict(width=2, color='#1f77b4'),
-        hovertemplate='%{x}<br>' + f'{sy}年实际: ' + dau_hover + '<extra></extra>'))
-    if not m_fc.empty:
+        fig_m = go.Figure()
         fig_m.add_trace(go.Scatter(
-            x=m_fc['日期'], y=(m_fc[col_src_dau] / 1e4).round(0),
-            mode='lines', name=f'{sy}年预估(人工)', line=dict(width=2, dash='dash', color='#2ca02c'),
-            hovertemplate='%{x}<br>' + f'{sy}年预估(人工): ' + dau_hover + '<extra></extra>'))
-    if not m_fc_adj.empty:
+            x=m_hist['日期'], y=(m_hist[col_src_dau] / 1e4).round(0),
+            mode='lines', name=f'{sy}年实际', line=dict(width=2, color='#1f77b4'),
+            hovertemplate='%{x}<br>' + f'{sy}年实际: ' + dau_hover + '<extra></extra>'))
+        if not m_fc.empty:
+            fig_m.add_trace(go.Scatter(
+                x=m_fc['日期'], y=(m_fc[col_src_dau] / 1e4).round(0),
+                mode='lines', name=f'{sy}年预估(人工)', line=dict(width=2, dash='dash', color='#2ca02c'),
+                hovertemplate='%{x}<br>' + f'{sy}年预估(人工): ' + dau_hover + '<extra></extra>'))
+        if not m_fc_adj.empty:
+            fig_m.add_trace(go.Scatter(
+                x=m_fc_adj['日期'], y=(m_fc_adj[col_src_dau] / 1e4).round(0),
+                mode='markers', name='YoY调整点',
+                marker=dict(size=8, symbol='diamond', color='orange'),
+                hovertemplate='%{x}<br>预估(调整): ' + dau_hover + '<extra></extra>'))
         fig_m.add_trace(go.Scatter(
-            x=m_fc_adj['日期'], y=(m_fc_adj[col_src_dau] / 1e4).round(0),
-            mode='markers', name='YoY调整点',
-            marker=dict(size=8, symbol='diamond', color='orange'),
-            hovertemplate='%{x}<br>预估(调整): ' + dau_hover + '<extra></extra>'))
-    fig_m.add_trace(go.Scatter(
-        x=manual_result_df['日期'], y=(manual_result_df[col_ref_dau] / 1e4).round(0),
-        mode='lines', name=f'{ry}年参考日期', line=dict(width=1, dash='dot', color='gray'),
-        hovertemplate='%{x}<br>' + f'{ry}年参考日期: ' + dau_hover + '<extra></extra>'))
-    fig_m.add_trace(go.Scatter(
-        x=manual_result_df['日期'], y=(manual_result_df[col_ref_week_dau] / 1e4).round(0),
-        mode='lines', name=f'{ry}年周对齐', line=dict(width=1, dash='dashdot', color='#ff7f0e'),
-        hovertemplate='%{x}<br>' + f'{ry}年周对齐: ' + dau_hover + '<extra></extra>'))
-    fig_m.update_layout(title="每日DAU趋势与预估（人工）", xaxis_title="日期", yaxis_title="DAU(万)",
-                        height=450, legend=dict(orientation="h", y=-0.12))
-    st.plotly_chart(fig_m, use_container_width=True)
+            x=manual_result_df['日期'], y=(manual_result_df[col_ref_dau] / 1e4).round(0),
+            mode='lines', name=f'{ry}年参考日期', line=dict(width=1, dash='dot', color='gray'),
+            hovertemplate='%{x}<br>' + f'{ry}年参考日期: ' + dau_hover + '<extra></extra>'))
+        fig_m.add_trace(go.Scatter(
+            x=manual_result_df['日期'], y=(manual_result_df[col_ref_week_dau] / 1e4).round(0),
+            mode='lines', name=f'{ry}年周对齐', line=dict(width=1, dash='dashdot', color='#ff7f0e'),
+            hovertemplate='%{x}<br>' + f'{ry}年周对齐: ' + dau_hover + '<extra></extra>'))
+        fig_m.update_layout(title="每日DAU趋势与预估（人工）", xaxis_title="日期", yaxis_title="DAU(万)",
+                            height=450, legend=dict(orientation="h", y=-0.12))
+        st.plotly_chart(fig_m, use_container_width=True)
 
-    # 人工预测明细表
-    with st.expander("人工预测明细表", expanded=False):
-        m_show = manual_result_df[['日期', col_src_dau, '数据类型', col_ref_date, col_ref_dau, 'YoY%']].copy()
-        m_show.insert(1, col_src_week, m_show['日期'].apply(_weekday_label))
-        m_show.insert(m_show.columns.get_loc(col_ref_date) + 1, col_ref_week,
-                      m_show[col_ref_date].apply(_weekday_label))
-        m_show[col_src_dau] = (m_show[col_src_dau] / 1e4).round(1)
-        m_show[col_ref_dau] = (m_show[col_ref_dau] / 1e4).round(1)
-        m_show['YoY%'] = m_show['YoY%'].round(1)
-        m_show.columns = disp_cols
-        st.dataframe(m_show, use_container_width=True, height=400)
+        with st.expander("人工预测明细表", expanded=False):
+            m_show = manual_result_df[['日期', col_src_dau, '数据类型', col_ref_date, col_ref_dau, 'YoY%']].copy()
+            m_show.insert(1, col_src_week, m_show['日期'].apply(_weekday_label))
+            m_show.insert(m_show.columns.get_loc(col_ref_date) + 1, col_ref_week,
+                          m_show[col_ref_date].apply(_weekday_label))
+            m_show[col_src_dau] = (m_show[col_src_dau] / 1e4).round(1)
+            m_show[col_ref_dau] = (m_show[col_ref_dau] / 1e4).round(1)
+            m_show['YoY%'] = m_show['YoY%'].round(1)
+            m_show.columns = disp_cols
+            st.dataframe(m_show, use_container_width=True, height=400)
 
-    # 人工预估导出
-    m_export = manual_result_df[['日期', col_src_dau, col_ref_date, col_ref_dau, 'YoY%']].copy()
-    m_export.columns = [f'{sy}年日期', f'{sy}年DAU', f'同比{ry}年参考日期', f'{ry}年参考DAU', 'YoY%']
-    m_export[f'{sy}年日期'] = m_export[f'{sy}年日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
-    m_export[f'同比{ry}年参考日期'] = m_export[f'同比{ry}年参考日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
-    m_export['YoY%'] = m_export['YoY%'].round(2)
+        m_export = manual_result_df[['日期', col_src_dau, col_ref_date, col_ref_dau, 'YoY%']].copy()
+        m_export.columns = [f'{sy}年日期', f'{sy}年DAU', f'同比{ry}年参考日期', f'{ry}年参考DAU', 'YoY%']
+        m_export[f'{sy}年日期'] = m_export[f'{sy}年日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
+        m_export[f'同比{ry}年参考日期'] = m_export[f'同比{ry}年参考日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
+        m_export['YoY%'] = m_export['YoY%'].round(2)
 
-    m_buffer = io.BytesIO()
-    m_export.to_excel(m_buffer, index=False, engine='openpyxl')
-    st.download_button("📥 导出Excel（人工预估）", data=m_buffer.getvalue(),
-                       file_name="DAU预估_人工.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       key="btn_export_manual")
+        m_buffer = io.BytesIO()
+        m_export.to_excel(m_buffer, index=False, engine='openpyxl')
+        st.download_button("📥 导出Excel（人工预估）", data=m_buffer.getvalue(),
+                           file_name="DAU预估_人工.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="btn_export_manual")
 
     # ── 预估探讨 ──
     st.markdown("---")
