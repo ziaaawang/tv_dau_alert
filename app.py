@@ -5,6 +5,7 @@ TV端 DAU 归因分析 — Streamlit 应用
 import os
 import sys
 import time
+import threading
 import requests
 import pandas as pd
 import numpy as np
@@ -44,11 +45,12 @@ st.markdown("""
         font-size: 14px;
     }
     .styled-table-wrap th {
-        background: #f0f2f6;
-        font-weight: 600;
+        background: #1a1a1a;
+        color: #ffffff;
+        font-weight: 700;
         padding: 8px 12px;
         text-align: center !important;
-        border-bottom: 2px solid #ddd;
+        border-bottom: 1px solid #1a1a1a;
     }
     .styled-table-wrap td {
         padding: 6px 12px;
@@ -57,6 +59,14 @@ st.markdown("""
     }
     .styled-table-wrap tr:hover td {
         background-color: #f8f9fb;
+    }
+    .styled-table-wrap tr.group-start td,
+    .styled-table-wrap tr.group-start th {
+        border-top: 2px solid #1a1a1a !important;
+    }
+    .styled-table-wrap tr.group-end td,
+    .styled-table-wrap tr.group-end th {
+        border-bottom: 2px solid #1a1a1a !important;
     }
     /* 展示指标筛选器样式 */
     div[data-testid="stMultiSelect"] label p {
@@ -107,8 +117,12 @@ def _headers():
     }
 
 
-def execute_sql(sql, status_placeholder=None):
-    """提交SQL → 轮询 → 取结果，返回 DataFrame"""
+def execute_sql(sql, status_placeholder=None, outer_placeholder=None, step_label=None, expected_seconds=30):
+    """提交SQL → 轮询 → 取结果，返回 DataFrame
+    outer_placeholder: expander外部的状态占位符，轮询时同步显示进度
+    step_label: 外部进度文案前缀，如"（1/3）去年同期"
+    expected_seconds: 预估完成时间（秒），用于计算百分比进度
+    """
     # 提交
     url = f"{ADHOC_BASE_URL}/api/adhoc/outer/v2/sql/execute"
     resp = requests.post(url, json={
@@ -139,10 +153,16 @@ def execute_sql(sql, status_placeholder=None):
             raise RuntimeError(f"SQL执行失败: {err_resp.json().get('msg', '未知错误')}")
         if time.time() - start > POLL_TIMEOUT:
             raise TimeoutError(f"SQL执行超时（{POLL_TIMEOUT}s）")
-        elapsed = int(time.time() - start)
-        if status_placeholder:
-            status_placeholder.info(f"SQL执行中... 已等待 {elapsed}s")
-        time.sleep(POLL_INTERVAL)
+        # 每秒刷新进度，累计到 POLL_INTERVAL 后再发下一次状态查询
+        for _ in range(POLL_INTERVAL):
+            elapsed = int(time.time() - start)
+            if status_placeholder:
+                status_placeholder.info(f"SQL执行中... 已等待 {elapsed}s")
+            if outer_placeholder:
+                pct = min(int(elapsed / expected_seconds * 100), 95)
+                prefix = f"{step_label} " if step_label else ""
+                outer_placeholder.info(f"⏳ {prefix}SQL 执行中 {pct}%，请勿切换页面... （已等待 {elapsed}s）")
+            time.sleep(1)
 
     # 取结果（全量数据，不用 preview 模式）
     result_url = f"{ADHOC_BASE_URL}/api/adhoc/outer/v2/sql/result/{query_id}"
@@ -158,6 +178,50 @@ def execute_sql(sql, status_placeholder=None):
 
     df = pd.DataFrame(rows, columns=columns)
     return df
+
+
+# 后台预取状态（进程级共享，线程写入，主线程读取）
+_prefetch_store = {}
+_prefetch_lock  = threading.Lock()
+
+
+def _prefetch_worker(key, sql_26, sql_25):
+    """后台线程：跑两条SQL，结果写入 _prefetch_store[key]"""
+    try:
+        with _prefetch_lock:
+            _prefetch_store[key] = {'status': 'running'}
+        df_26 = execute_sql(sql_26)
+        df_26['dau'] = pd.to_numeric(df_26['dau'], errors='coerce').fillna(0)
+        df_25 = execute_sql(sql_25)
+        df_25['dau'] = pd.to_numeric(df_25['dau'], errors='coerce').fillna(0)
+        with _prefetch_lock:
+            _prefetch_store[key] = {'status': 'done', 'df_26': df_26, 'df_25': df_25}
+    except Exception as e:
+        with _prefetch_lock:
+            _prefetch_store[key] = {'status': 'error', 'error': str(e)}
+
+
+def trigger_prefetch(key, sql_26, sql_25):
+    """若该key尚未在跑，启动后台预取线程"""
+    with _prefetch_lock:
+        existing = _prefetch_store.get(key, {})
+    if existing.get('status') in ('running', 'done'):
+        return  # 已在跑或已完成，无需重复
+    t = threading.Thread(target=_prefetch_worker, args=(key, sql_26, sql_25), daemon=True)
+    t.start()
+
+
+def get_prefetch_result(key):
+    """返回预取状态：None / 'running' / ('done', df_26, df_25) / ('error', msg)"""
+    with _prefetch_lock:
+        r = _prefetch_store.get(key)
+    if r is None:
+        return None
+    if r['status'] == 'running':
+        return 'running'
+    if r['status'] == 'done':
+        return ('done', r['df_26'], r['df_25'])
+    return ('error', r.get('error', '未知错误'))
 
 
 # ═══════════════════════════════════════════
@@ -701,7 +765,7 @@ def compute_attribution(df, obs_start, obs_end, cmp_start, cmp_end):
             merged['DAU占比%'] = (merged['dau_obs'] / parent_dau * 100).round(1)
             merged.loc[parent_dau == 0, 'DAU占比%'] = None
         merged['贡献度/占比'] = merged.apply(
-            lambda r: round(r['贡献度%'] / r['DAU占比%'], 2) if pd.notna(r.get('贡献度%')) and r.get('DAU占比%', 0) > 0 else None,
+            lambda r: round(r['贡献度%'] / r['DAU占比%'], 1) if pd.notna(r.get('贡献度%')) and r.get('DAU占比%', 0) > 0 else None,
             axis=1
         )
 
@@ -989,9 +1053,9 @@ def style_contrib_bar(df, col='贡献pp'):
         elif c in ('YoY%', '贡献pp', '占比变化pp', '结构贡献pp', '规模贡献pp'):
             fmt[c] = '{:+.1f}'
         elif c in ('贡献度%', 'DAU占比%'):
-            fmt[c] = '{:.1f}'
+            fmt[c] = '{:+.1f}'
         elif c == '贡献度/占比':
-            fmt[c] = '{:.2f}'
+            fmt[c] = '{:+.1f}'
 
     if col is None or col not in df.columns:
         return df.style.format(fmt, na_rep='-').hide(axis='index')
@@ -1016,7 +1080,48 @@ def style_contrib_bar(df, col='贡献pp'):
                 f'color: #16a34a; font-weight: 600'
             )
 
-    styled = df.style.map(bar_css, subset=[col]).format(fmt, na_rep='-').hide(axis='index')
+    # 贡献度%/DAU占比%：数据条（复用 bar_css，但用各自的 abs_max）
+    def make_bar_css_col(series):
+        col_abs_max = series.abs().max() if not series.isna().all() else 1
+        if col_abs_max == 0:
+            col_abs_max = 1
+        def _css(val):
+            if pd.isna(val) or val == 0:
+                return ''
+            half_pct = min(abs(val) / col_abs_max * 50, 50)
+            if val > 0:
+                return (
+                    f'background: linear-gradient(to right, transparent 50%, rgba(220,38,38,0.3) 50%, rgba(220,38,38,0.3) {50 + half_pct:.0f}%, transparent {50 + half_pct:.0f}%);'
+                    f'color: #dc2626; font-weight: 600'
+                )
+            else:
+                left = 50 - half_pct
+                return (
+                    f'background: linear-gradient(to right, transparent {left:.0f}%, rgba(22,163,74,0.3) {left:.0f}%, rgba(22,163,74,0.3) 50%, transparent 50%);'
+                    f'color: #16a34a; font-weight: 600'
+                )
+        return _css
+
+    # 仅着色：YoY% 正红负绿，贡献度/占比 >1红 <1绿
+    def yoy_color_css(val):
+        if pd.isna(val) or val == 0:
+            return ''
+        return 'color: #dc2626; font-weight: 600' if val > 0 else 'color: #16a34a; font-weight: 600'
+
+    def ratio_color_css(val):
+        if pd.isna(val):
+            return ''
+        return 'color: #dc2626; font-weight: 600' if val > 1 else 'color: #16a34a; font-weight: 600'
+
+    styled = df.style.map(bar_css, subset=[col])
+    for extra_col in ('贡献度%', 'DAU占比%'):
+        if extra_col in df.columns:
+            styled = styled.map(make_bar_css_col(df[extra_col]), subset=[extra_col])
+    if 'YoY%' in df.columns:
+        styled = styled.map(yoy_color_css, subset=['YoY%'])
+    if '贡献度/占比' in df.columns:
+        styled = styled.map(ratio_color_css, subset=['贡献度/占比'])
+    styled = styled.format(fmt, na_rep='-').hide(axis='index')
     return styled
 
 
@@ -1031,6 +1136,9 @@ def render_merged_df(df, dim_cols, bar_col='贡献pp'):
     def _fmt_dau(v):
         return f'{v:.0f}' if pd.notna(v) else '-'
 
+    def _fmt_dau_precise(v):
+        return f'{v:.1f}' if pd.notna(v) else '-'
+
     def _fmt_signed(v):
         return f'{v:+.1f}' if pd.notna(v) else '-'
 
@@ -1039,6 +1147,12 @@ def render_merged_df(df, dim_cols, bar_col='贡献pp'):
 
     def _fmt_ratio(v):
         return f'{v:.2f}' if pd.notna(v) else '-'
+
+    def _fmt_signed_pct(v):
+        return f'{v:+.1f}' if pd.notna(v) else '-'
+
+    def _fmt_ratio_signed(v):
+        return f'{v:+.1f}' if pd.notna(v) else '-'
 
     fmt_funcs = {}
     for c in df.columns:
@@ -1049,9 +1163,9 @@ def render_merged_df(df, dim_cols, bar_col='贡献pp'):
         elif c in ('YoY%', '贡献pp', '占比变化pp', '结构贡献pp', '规模贡献pp'):
             fmt_funcs[c] = _fmt_signed
         elif c in ('贡献度%', 'DAU占比%'):
-            fmt_funcs[c] = _fmt_pct
+            fmt_funcs[c] = _fmt_signed_pct
         elif c == '贡献度/占比':
-            fmt_funcs[c] = _fmt_ratio
+            fmt_funcs[c] = _fmt_ratio_signed
 
     abs_max = 1
     if bar_col and bar_col in df.columns:
@@ -1106,10 +1220,29 @@ def render_merged_df(df, dim_cols, bar_col='贡献pp'):
                     rowspans[col][k] = 0  # 被合并
                 i = j
 
+    # 计算最外层维度分组的起始行和结束行集合（用于画黑实线）
+    outer_col = dim_cols[0] if dim_cols else None
+    outer_group_starts = set()
+    outer_group_ends = set()
+    if outer_col:
+        for idx in range(n):
+            sp = rowspans[outer_col][idx]
+            if sp > 0:
+                outer_group_starts.add(idx)
+                outer_group_ends.add(idx + sp - 1)
+
     # 生成 HTML
     header = '<tr>' + ''.join(f'<th>{c}</th>' for c in df.columns) + '</tr>'
     rows_html = []
     for i in range(n):
+        is_group_start = i in outer_group_starts
+        is_group_end = i in outer_group_ends
+        tr_classes = []
+        if is_group_start:
+            tr_classes.append('group-start')
+        if is_group_end:
+            tr_classes.append('group-end')
+        tr_class_attr = f' class="{" ".join(tr_classes)}"' if tr_classes else ''
         cells = []
         for c in df.columns:
             if c in dim_cols:
@@ -1117,25 +1250,101 @@ def render_merged_df(df, dim_cols, bar_col='贡献pp'):
                 if span == 0:
                     continue  # 被合并
                 val = str(df.iloc[i][c])
+                td_style = 'vertical-align:middle; font-weight:500;'
+                if is_group_start:
+                    td_style += ' border-top: 1px solid #1a1a1a;'
+                # rowspan 单元格跨多行，结束边框必须内联加（tr.group-end 影响不到它）
                 if span > 1:
-                    cells.append(f'<td rowspan="{span}" style="vertical-align:middle; font-weight:500;">{val}</td>')
+                    end_row = i + span - 1
+                    if end_row in outer_group_ends:
+                        td_style += ' border-bottom: 1px solid #1a1a1a;'
+                    cells.append(f'<td rowspan="{span}" style="{td_style}">{val}</td>')
                 else:
-                    cells.append(f'<td>{val}</td>')
+                    if is_group_end:
+                        td_style += ' border-bottom: 1px solid #1a1a1a;'
+                    cells.append(f'<td style="{td_style}">{val}</td>')
             else:
                 raw = df.iloc[i][c]
                 fmt_fn = fmt_funcs.get(c)
+                # DAU(万) 列：当日新增行用1位小数
+                if 'DAU(万)' in c and fmt_fn == _fmt_dau:
+                    row_vals = ' '.join(str(df.iloc[i][d]) for d in dim_cols if d in df.columns)
+                    if '新增' in row_vals:
+                        fmt_fn = _fmt_dau_precise
                 text = fmt_fn(raw) if fmt_fn else (str(raw) if pd.notna(raw) else '-')
                 style = ''
                 if c == bar_col:
                     style = _bar_style(raw)
+                elif c in ('贡献度%', 'DAU占比%') and pd.notna(raw) and raw != 0:
+                    col_abs_max = df[c].abs().max() if not df[c].isna().all() else 1
+                    if col_abs_max == 0:
+                        col_abs_max = 1
+                    half_pct = min(abs(raw) / col_abs_max * 50, 50)
+                    if raw > 0:
+                        style = (
+                            f'background: linear-gradient(to right, transparent 50%, rgba(220,38,38,0.3) 50%, rgba(220,38,38,0.3) {50 + half_pct:.0f}%, transparent {50 + half_pct:.0f}%);'
+                            f'color: #dc2626; font-weight: 600'
+                        )
+                    else:
+                        left = 50 - half_pct
+                        style = (
+                            f'background: linear-gradient(to right, transparent {left:.0f}%, rgba(22,163,74,0.3) {left:.0f}%, rgba(22,163,74,0.3) 50%, transparent 50%);'
+                            f'color: #16a34a; font-weight: 600'
+                        )
+                elif c == 'YoY%' and pd.notna(raw) and raw != 0:
+                    style = 'color: #dc2626; font-weight: 600' if raw > 0 else 'color: #16a34a; font-weight: 600'
+                elif c == '贡献度/占比' and pd.notna(raw):
+                    style = 'color: #dc2626; font-weight: 600' if raw > 1 else 'color: #16a34a; font-weight: 600'
                 if style:
                     cells.append(f'<td style="{style}">{text}</td>')
                 else:
                     cells.append(f'<td>{text}</td>')
-        rows_html.append('<tr>' + ''.join(cells) + '</tr>')
+        rows_html.append(f'<tr{tr_class_attr}>' + ''.join(cells) + '</tr>')
 
-    html = f'<table>{header}{"".join(rows_html)}</table>'
-    st.markdown(f'<div class="styled-table-wrap">{html}</div>', unsafe_allow_html=True)
+    import hashlib
+    import streamlit.components.v1 as components
+
+    table_id = 'tbl_' + hashlib.md5(''.join(str(df.columns.tolist())).encode()).hexdigest()[:8]
+    html = f'<table id="{table_id}">{header}{"".join(rows_html)}</table>'
+
+    # 表格全局样式（复制主页面的 styled-table-wrap CSS）
+    table_css = """
+    <style>
+    body { margin: 0; font-family: sans-serif; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th { background: #1a1a1a; color: #fff; font-weight: 700; padding: 8px 12px;
+         text-align: center; border-bottom: 1px solid #1a1a1a; }
+    td { padding: 6px 12px; text-align: center; border-bottom: 1px solid #eee; }
+    tr:hover td { background-color: #f8f9fb; }
+    tr.group-start td, tr.group-start th { border-top: 1px solid #1a1a1a !important; }
+    tr.group-end td, tr.group-end th { border-bottom: 1px solid #1a1a1a !important; }
+    #dl-btn { margin: 6px 0; padding: 4px 12px; font-size: 13px; cursor: pointer;
+               border: 1px solid #ccc; border-radius: 4px; background: #fff; }
+    #dl-btn:active { background: #f0f0f0; }
+    </style>
+    """
+
+    component_html = f"""
+    {table_css}
+    <div id="wrap_{table_id}">{html}</div>
+    <button id="dl-btn">📸 下载为图片</button>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script>
+    document.getElementById('dl-btn').addEventListener('click', function() {{
+        var el = document.getElementById('wrap_{table_id}');
+        html2canvas(el, {{backgroundColor: '#ffffff', scale: 2}}).then(function(canvas) {{
+            var a = document.createElement('a');
+            a.href = canvas.toDataURL('image/png');
+            a.download = '{table_id}.png';
+            a.click();
+        }});
+    }});
+    </script>
+    """
+
+    # 估算表格高度：每行约28px + 表头40px + 按钮30px + buffer
+    est_height = len(rows_html) * 30 + 100
+    components.html(component_html, height=est_height, scrolling=True)
 
 
 def _render_card(level_name, df, obs_col_name, cmp_col_name, metric_cols, default_metric_cols, is_extra):
@@ -1594,30 +1803,79 @@ def _render_short_term_forecast():
     import io
     import plotly.graph_objects as go
 
+    st.caption(
+        "预估逻辑：取历史数据起始～截止日的实际DAU，在 YoY 基准期内分别计算工作日/周末的平均同比，"
+        "再按该同比逐日推算预测区间的 DAU。"
+        "假期因子（暑假/寒假等）可单独设置 YoY，优先级高于基础同比；"
+        "手动覆盖优先级最高。"
+    )
+
     st.markdown("#### 参数设置")
 
     today = date.today()
 
+    def _quarter_end(d):
+        """返回日期所在季度的最后一天"""
+        q = (d.month - 1) // 3
+        last_month = [3, 6, 9, 12][q]
+        last_day = [31, 30, 30, 31][q]
+        return date(d.year, last_month, last_day)
+
     # 从session_state恢复上次参数（防止模式切换后widget重置）
     saved = st.session_state.get('fc_saved_params', {})
+
+    # 默认值计算
+    _hist_end_default = today - timedelta(days=1)
+    _hist_start_default = (_hist_end_default.replace(day=1) - timedelta(days=1)).replace(day=1)
+    # 再往前一个月：hist_end所在月的前两个月的第一天
+    _m = _hist_end_default.month - 2
+    _y = _hist_end_default.year
+    if _m <= 0:
+        _m += 12
+        _y -= 1
+    _hist_start_default = date(_y, _m, 1)
+
+    _fc_start_default = today
+    _ref_end_default = _fc_start_default - timedelta(days=1)
+    _ref_start_default = _fc_start_default - timedelta(weeks=2)
+
+    # pending机制：fc_start变化时自动将fc_end更新为季度末，并联动更新YoY基准期
+    if 'fc_end_pending' in st.session_state:
+        st.session_state['fc_end'] = st.session_state.pop('fc_end_pending')
+    if 'fc_ref_start_pending' in st.session_state:
+        st.session_state['fc_ref_start'] = st.session_state.pop('fc_ref_start_pending')
+    if 'fc_ref_end_pending' in st.session_state:
+        st.session_state['fc_ref_end'] = st.session_state.pop('fc_ref_end_pending')
+
     col1, col2 = st.columns(2)
     with col1:
         hist_start = st.date_input("历史数据起始日",
-            value=saved.get('hist_start', date(2026, 1, 1)), key="fc_hist_start")
+            value=saved.get('hist_start', _hist_start_default), key="fc_hist_start")
         fc_start = st.date_input("预测起始日",
-            value=saved.get('fc_start', today), key="fc_start")
+            value=saved.get('fc_start', _fc_start_default), key="fc_start")
     with col2:
         hist_end = st.date_input("历史数据截止日",
-            value=saved.get('hist_end', today - timedelta(days=1)), key="fc_hist_end")
+            value=saved.get('hist_end', _hist_end_default), key="fc_hist_end")
         fc_end = st.date_input("预测截止日",
-            value=saved.get('fc_end', today + timedelta(days=30)), key="fc_end")
+            value=saved.get('fc_end', _quarter_end(_fc_start_default)), key="fc_end")
 
+    # 检测fc_start变化，联动更新fc_end为季度末、YoY基准期为前两周
+    prev_fc_start = st.session_state.get('_prev_fc_start')
+    if prev_fc_start != fc_start:
+        st.session_state['_prev_fc_start'] = fc_start
+        if prev_fc_start is not None:
+            st.session_state['fc_end_pending'] = _quarter_end(fc_start)
+            st.session_state['fc_ref_end_pending'] = fc_start - timedelta(days=1)
+            st.session_state['fc_ref_start_pending'] = fc_start - timedelta(weeks=2)
+            st.rerun()
+
+    st.caption("YoY基准期：用于计算AI预估的YoY参考水位——取该区间内工作日/周末的平均YoY%。默认为预测起始日前两周，随预测起始日自动更新。")
     ref_col1, ref_col2 = st.columns(2)
     with ref_col1:
-        ref_start_default = saved.get('ref_start', today - timedelta(days=14))
+        ref_start_default = saved.get('ref_start', _ref_start_default)
         ref_yoy_start = st.date_input("YoY基准期 起始", value=ref_start_default, key="fc_ref_start")
     with ref_col2:
-        ref_end_default = saved.get('ref_end', today - timedelta(days=1))
+        ref_end_default = saved.get('ref_end', _ref_end_default)
         ref_yoy_end = st.date_input("YoY基准期 截止", value=ref_end_default, key="fc_ref_end")
     ref_days = max((ref_yoy_end - ref_yoy_start).days + 1, 1)  # 保留兼容，供其他地方展示天数用
 
@@ -1691,93 +1949,95 @@ def _render_short_term_forecast():
             },
         ]
 
+    _hf_outer_status = st.empty()  # expander外部状态提示，加载时可见
     with st.expander("🏖️ 假期因子（暑假/寒假工作日YoY单独设置）", expanded=False):
         st.caption("假期内工作日行为接近周末，需单独设YoY。优先级低于「手动日期覆盖」，高于基础工作日/周末YoY。")
 
-        # ── 独立加载去年同期数据（不依赖主预估历史数据）──
-        hf_list_preview = st.session_state.get('fc_holiday_factors', [])
-        enabled_hfs = [hf for hf in hf_list_preview if hf.get('enabled', True)]
-        if enabled_hfs:
-            # 计算所有启用假期的去年同期区间，合并为最小查询范围
-            ly_starts = []
-            ly_ends = []
-            lyy_starts = []  # 前年（对比基准）
-            lyy_ends = []
-            for hf in hf_list_preview:
-                last_year = hf['start'].year - 1
-                try:
-                    ly_s = hf['start'].replace(year=last_year)
-                    ly_e = hf['end'].replace(year=last_year)
-                except ValueError:
-                    ly_s = hf['start'].replace(year=last_year, day=28)
-                    ly_e = hf['end'].replace(year=last_year, day=28)
-                ly_starts.append(ly_s)
-                ly_ends.append(ly_e)
-                prev_year = last_year - 1
-                try:
-                    lyy_starts.append(hf['start'].replace(year=prev_year))
-                    lyy_ends.append(hf['end'].replace(year=prev_year))
-                except ValueError:
-                    lyy_starts.append(hf['start'].replace(year=prev_year, day=28))
-                    lyy_ends.append(hf['end'].replace(year=prev_year, day=28))
+        # ── 自动加载去年/前年同期数据 ──
+        # 默认区间：月日取自 hist_start 和 fc_end，年份分别为去年/前年
+        _ly_year  = src_year - 1
+        _lyy_year = src_year - 2
+        try:
+            hf_ly_start_auto  = hist_start.replace(year=_ly_year)
+            hf_ly_end_auto    = fc_end.replace(year=_ly_year)
+        except ValueError:
+            hf_ly_start_auto  = hist_start.replace(year=_ly_year, day=28)
+            hf_ly_end_auto    = fc_end.replace(year=_ly_year, day=28)
+        try:
+            hf_lyy_start_auto = hist_start.replace(year=_lyy_year)
+            hf_lyy_end_auto   = fc_end.replace(year=_lyy_year)
+        except ValueError:
+            hf_lyy_start_auto = hist_start.replace(year=_lyy_year, day=28)
+            hf_lyy_end_auto   = fc_end.replace(year=_lyy_year, day=28)
 
-            hf_ly_min_default = min(ly_starts)
-            hf_ly_max_default = max(ly_ends)
-            hf_lyy_min_default = min(lyy_starts)
-            hf_lyy_max_default = max(lyy_ends)
+        hf_ly_min  = hf_ly_start_auto.strftime('%Y%m%d')
+        hf_ly_max  = hf_ly_end_auto.strftime('%Y%m%d')
+        hf_lyy_min = hf_lyy_start_auto.strftime('%Y%m%d')
+        hf_lyy_max = hf_lyy_end_auto.strftime('%Y%m%d')
+        # 今年同期（用于暑假自动计算中今年5月均值）
+        hf_cur_min = hist_start.strftime('%Y%m%d')
+        hf_cur_max = fc_end.strftime('%Y%m%d')
 
-            # 支持手动调整查询区间
-            rd1, rd2, rd3, rd4 = st.columns(4)
-            with rd1:
-                hf_ly_start_input = st.date_input("去年同期 起始",
-                    value=st.session_state.get('hf_ly_start_input', hf_ly_min_default),
-                    key="hf_ly_start_input")
-            with rd2:
-                hf_ly_end_input = st.date_input("去年同期 截止",
-                    value=st.session_state.get('hf_ly_end_input', hf_ly_max_default),
-                    key="hf_ly_end_input")
-            with rd3:
-                hf_lyy_start_input = st.date_input("前年同期 起始",
-                    value=st.session_state.get('hf_lyy_start_input', hf_lyy_min_default),
-                    key="hf_lyy_start_input")
-            with rd4:
-                hf_lyy_end_input = st.date_input("前年同期 截止",
-                    value=st.session_state.get('hf_lyy_end_input', hf_lyy_max_default),
-                    key="hf_lyy_end_input")
+        # 参数变化时自动重新加载
+        _hf_load_key = (hf_ly_min, hf_ly_max, hf_lyy_min, hf_lyy_max, hf_cur_min, hf_cur_max)
+        if st.session_state.get('_hf_load_key') != _hf_load_key:
+            st.session_state.pop('hf_data_ly', None)
+            st.session_state.pop('hf_data_lyy', None)
+            st.session_state.pop('hf_data_cur', None)
 
-            hf_ly_min = hf_ly_start_input.strftime('%Y%m%d')
-            hf_ly_max = hf_ly_end_input.strftime('%Y%m%d')
-            hf_lyy_min = hf_lyy_start_input.strftime('%Y%m%d')
-            hf_lyy_max = hf_lyy_end_input.strftime('%Y%m%d')
+        hf_data_loaded = 'hf_data_ly' in st.session_state and 'hf_data_lyy' in st.session_state
+        _hf_status = st.empty()
+        if not hf_data_loaded:
+            try:
+                sql_ly  = build_daily_dau_sql(hf_ly_min, hf_ly_max)
+                sql_lyy = build_daily_dau_sql(hf_lyy_min, hf_lyy_max)
+                sql_cur = build_daily_dau_sql(hf_cur_min, hf_cur_max)
 
-            hf_data_loaded = 'hf_data_ly' in st.session_state and 'hf_data_lyy' in st.session_state
-            if hf_data_loaded:
-                st.success(f"✅ 去年同期数据已加载（{hf_ly_min[:6]} ~ {hf_ly_max[:6]}），如需重新加载请点击下方按钮")
+                _hf_status.info("正在加载去年同期数据...")
+                df_ly  = execute_sql(sql_ly, _hf_status,
+                                     outer_placeholder=_hf_outer_status,
+                                     step_label="（1/3）去年同期")
+                df_ly['dau'] = pd.to_numeric(df_ly['dau'], errors='coerce').fillna(0)
 
-            load_col, reload_col = st.columns([2, 1])
-            with load_col:
-                btn_label = "🔄 重新加载去年同期数据" if hf_data_loaded else "📥 加载去年同期数据"
-                if st.button(btn_label, key="btn_load_hf_data"):
-                    _status = st.empty()
-                    sql_ly = build_daily_dau_sql(hf_ly_min, hf_ly_max)
-                    sql_lyy = build_daily_dau_sql(hf_lyy_min, hf_lyy_max)
-                    try:
-                        _status.info("正在查询去年同期数据...")
-                        df_ly = execute_sql(sql_ly, _status)
-                        df_ly['dau'] = pd.to_numeric(df_ly['dau'], errors='coerce').fillna(0)
-                        _status.info("正在查询前年同期数据...")
-                        df_lyy = execute_sql(sql_lyy, _status)
-                        df_lyy['dau'] = pd.to_numeric(df_lyy['dau'], errors='coerce').fillna(0)
-                        st.session_state['hf_data_ly'] = df_ly
-                        st.session_state['hf_data_lyy'] = df_lyy
-                        _status.success("✅ 去年同期数据加载完成")
-                        st.rerun()
-                    except Exception as e:
-                        _status.error(f"加载失败: {e}")
+                _hf_status.info("正在加载前年同期数据...")
+                df_lyy = execute_sql(sql_lyy, _hf_status,
+                                     outer_placeholder=_hf_outer_status,
+                                     step_label="（2/3）前年同期")
+                df_lyy['dau'] = pd.to_numeric(df_lyy['dau'], errors='coerce').fillna(0)
+
+                _hf_status.info("正在加载今年同期数据...")
+                df_cur = execute_sql(sql_cur, _hf_status,
+                                     outer_placeholder=_hf_outer_status,
+                                     step_label="（3/3）今年同期")
+                df_cur['dau'] = pd.to_numeric(df_cur['dau'], errors='coerce').fillna(0)
+                st.session_state['hf_data_ly']  = df_ly
+                st.session_state['hf_data_lyy'] = df_lyy
+                st.session_state['hf_data_cur'] = df_cur
+                st.session_state['_hf_load_key'] = _hf_load_key
+                hf_data_loaded = True
+                _hf_status.success(f"✅ 今年/去年/前年同期数据已加载（{hf_ly_min[:6]} ~ {hf_ly_max[:6]}）")
+                _hf_outer_status.empty()
+            except Exception as e:
+                _hf_status.error(f"自动加载失败: {e}")
+                _hf_outer_status.error(f"❌ SQL 加载失败: {e}")
+        else:
+            st.session_state['_hf_load_key'] = _hf_load_key
+            _hf_status.success(f"✅ 今年/去年/前年同期数据已加载（{hf_ly_min[:6]} ~ {hf_ly_max[:6]}）")
+            _hf_outer_status.empty()
 
         # 自动计算函数：优先用独立加载的去年同期数据，其次用主预估历史数据
         def _auto_calc_hf_yoy(hf_start, hf_end):
-            """用去年同期数据，计算去年同期（对比前年）的实际YoY，分工作日/周末返回"""
+            """
+            假期YoY自动计算。
+            暑假专用逻辑（hf_start.month==7）：
+              周中：lift_wd = 去年暑假工作日均值 / 去年5月最后两周工作日均值
+                    pred_wd = 今年5月最后两周工作日均值 × lift_wd
+                    wd_yoy% = pred_wd / 去年暑假工作日均值 - 1
+              周末：lift_we = 去年暑假周末均值 / 去年5月最后周末均值
+                    pred_we = 今年5月最后周末均值 × lift_we
+                    we_yoy% = pred_we / 去年暑假周末均值 - 1
+            其他假期：沿用去年同期对前年的实际YoY均值。
+            """
             from calendar_config import _is_weekend, _get_holiday_info
 
             # 优先用独立加载的去年同期数据
@@ -1790,60 +2050,123 @@ def _render_short_term_forecast():
             else:
                 return None, None, None
 
-            df_hist = df_hist_src.copy()
-            df_ref = df_ref_src.copy()
+            def _to_dau_dict(df):
+                m = {}
+                for _, row in df.iterrows():
+                    d = row['log_date']
+                    if isinstance(d, str):
+                        d = datetime.strptime(d, '%Y%m%d').date()
+                    m[d] = float(row['dau'])
+                return m
 
-            # 把历史数据转为 date→dau 字典
-            dau_hist = {}
-            for _, row in df_hist.iterrows():
-                d = row['log_date']
-                if isinstance(d, str):
-                    d = datetime.strptime(d, '%Y%m%d').date()
-                dau_hist[d] = float(row['dau'])
+            def _last_weekend_days_of_may(year):
+                """5月最后一个完整周末（周六+周日，需在5月内）"""
+                may31 = date(year, 5, 31)
+                dow = may31.weekday()
+                days_back = (dow + 1) % 7
+                last_sun = may31 - timedelta(days=days_back)
+                last_sat = last_sun - timedelta(days=1)
+                return [d for d in [last_sat, last_sun] if d.month == 5]
 
-            dau_ref = {}
-            for _, row in df_ref.iterrows():
-                d = row['log_date']
-                if isinstance(d, str):
-                    d = datetime.strptime(d, '%Y%m%d').date()
-                dau_ref[d] = float(row['dau'])
+            def _may_normal_weekend_days(year):
+                """5月所有普通周末日（周六或周日，且不在节假日内、非调休工作日）"""
+                from calendar_config import _is_transfer_work
+                days = []
+                d = date(year, 5, 1)
+                while d <= date(year, 5, 31):
+                    if _is_weekend(d) and not _get_holiday_info(d, year) and not _is_transfer_work(d, year):
+                        days.append(d)
+                    d += timedelta(days=1)
+                return days
 
-            # 去年同假期区间
-            last_year = hf_start.year - 1
-            try:
-                ly_start = hf_start.replace(year=last_year)
-                ly_end = hf_end.replace(year=last_year)
-            except ValueError:
-                ly_start = hf_start.replace(year=last_year, day=28)
-                ly_end = hf_end.replace(year=last_year, day=28)
+            # 判断是否为暑假（起始在7月）
+            is_summer = (hf_start.month == 7)
 
-            wd_yoys, we_yoys = [], []
-            d = ly_start
-            while d <= ly_end:
-                # 去年历史DAU
-                hist_dau = dau_hist.get(d)
-                # 前年参考DAU（直接用前一年同日期，假期本身就按自然日对齐）
+            if is_summer:
+                cur_year = hf_start.year
+                ly = cur_year - 1
+
+                dau_ly = _to_dau_dict(df_hist_src)
+                if 'hf_data_cur' in st.session_state:
+                    dau_cur = _to_dau_dict(st.session_state['hf_data_cur'])
+                elif 'fc_data_26' in st.session_state:
+                    dau_cur = _to_dau_dict(st.session_state['fc_data_26'])
+                else:
+                    dau_cur = _to_dau_dict(df_ref_src)
+
+                # 1. 去年暑假周中/周末 DAU 均值
+                ly_summer_wd_daus, ly_summer_we_daus = [], []
+                d = date(ly, 7, 1)
+                while d <= date(ly, 8, 31):
+                    dau = dau_ly.get(d)
+                    if dau:
+                        is_wknd = _is_weekend(d) or bool(_get_holiday_info(d, ly))
+                        (ly_summer_we_daus if is_wknd else ly_summer_wd_daus).append(dau)
+                    d += timedelta(days=1)
+
+                ly_summer_wd_avg = sum(ly_summer_wd_daus) / len(ly_summer_wd_daus) if ly_summer_wd_daus else None
+                ly_summer_we_avg = sum(ly_summer_we_daus) / len(ly_summer_we_daus) if ly_summer_we_daus else None
+
+                # 2. 去年/今年 5月普通周末 DAU 均值（周末基准）
+                ly_we_days  = _may_normal_weekend_days(ly)
+                cur_we_days = _may_normal_weekend_days(cur_year)
+                ly_may_we_daus  = [dau_ly[d]  for d in ly_we_days  if d in dau_ly]
+                cur_may_we_daus = [dau_cur[d] for d in cur_we_days if d in dau_cur]
+                ly_may_we_avg   = sum(ly_may_we_daus)  / len(ly_may_we_daus)  if ly_may_we_daus  else None
+                cur_may_we_avg  = sum(cur_may_we_daus) / len(cur_may_we_daus) if cur_may_we_daus else None
+
+                # 3. 计算今年暑假YoY
+                wd_result, we_result = None, None
+
+                # 周末：lift_we = 去年暑假周末均值 / 去年5月最后周末均值
+                if ly_summer_we_avg and ly_may_we_avg and cur_may_we_avg:
+                    lift_we  = ly_summer_we_avg / ly_may_we_avg
+                    pred_we  = cur_may_we_avg * lift_we
+                    we_result = round((pred_we / ly_summer_we_avg - 1) * 100, 1)
+
+                # 周中：在周末YoY基础上，叠加去年暑假周中/周末的相对差异
+                # wd_dau_ratio = 去年暑假周中均值 / 去年暑假周末均值
+                # 今年暑假预估周中DAU = 今年暑假预估周末DAU × wd_dau_ratio
+                # wd_yoy% = 今年暑假预估周中DAU / 去年暑假周中均值 - 1
+                if ly_summer_wd_avg and ly_summer_we_avg and we_result is not None:
+                    wd_dau_ratio = ly_summer_wd_avg / ly_summer_we_avg
+                    pred_we_dau  = ly_summer_we_avg * (1 + we_result / 100)
+                    pred_wd_dau  = pred_we_dau * wd_dau_ratio
+                    wd_result    = round((pred_wd_dau / ly_summer_wd_avg - 1) * 100, 1)
+
+                sample_n = len(ly_summer_wd_daus) + len(ly_summer_we_daus)
+                return wd_result, we_result, sample_n
+
+            else:
+                # 非暑假：去年同期对前年的实际YoY均值
+                dau_hist = _to_dau_dict(df_hist_src)
+                dau_ref  = _to_dau_dict(df_ref_src)
+                last_year = hf_start.year - 1
                 try:
-                    d_prev_year = d.replace(year=d.year - 1)
-                    ref_dau = dau_ref.get(d_prev_year)
+                    ly_start = hf_start.replace(year=last_year)
+                    ly_end   = hf_end.replace(year=last_year)
                 except ValueError:
-                    # 2月29日特殊处理
-                    d_prev_year = d.replace(year=d.year - 1, day=28)
-                    ref_dau = dau_ref.get(d_prev_year)
+                    ly_start = hf_start.replace(year=last_year, day=28)
+                    ly_end   = hf_end.replace(year=last_year, day=28)
 
-                if hist_dau and ref_dau and ref_dau > 0:
-                    yoy = (hist_dau / ref_dau - 1) * 100
-                    is_wknd = _is_weekend(d) or bool(_get_holiday_info(d, d.year))
-                    if is_wknd:
-                        we_yoys.append(yoy)
-                    else:
-                        wd_yoys.append(yoy)
-                d += timedelta(days=1)
+                wd_yoys, we_yoys = [], []
+                d = ly_start
+                while d <= ly_end:
+                    hist_dau = dau_hist.get(d)
+                    try:
+                        d_ref = d.replace(year=d.year - 1)
+                    except ValueError:
+                        d_ref = d.replace(year=d.year - 1, day=28)
+                    ref_dau = dau_ref.get(d_ref)
+                    if hist_dau and ref_dau and ref_dau > 0:
+                        yoy = (hist_dau / ref_dau - 1) * 100
+                        is_wknd = _is_weekend(d) or bool(_get_holiday_info(d, d.year))
+                        (we_yoys if is_wknd else wd_yoys).append(yoy)
+                    d += timedelta(days=1)
 
-            wd_avg = round(sum(wd_yoys) / len(wd_yoys), 1) if wd_yoys else None
-            we_avg = round(sum(we_yoys) / len(we_yoys), 1) if we_yoys else None
-            sample_n = len(wd_yoys) + len(we_yoys)
-            return wd_avg, we_avg, sample_n
+                wd_avg = round(sum(wd_yoys) / len(wd_yoys), 1) if wd_yoys else None
+                we_avg = round(sum(we_yoys) / len(we_yoys), 1) if we_yoys else None
+                return wd_avg, we_avg, len(wd_yoys) + len(we_yoys)
 
         has_hist_data = ('hf_data_ly' in st.session_state) or ('fc_data_26' in st.session_state)
         has_curve_data = 'hf_data_ly' in st.session_state and 'hf_data_lyy' in st.session_state
@@ -1914,7 +2237,9 @@ def _render_short_term_forecast():
                             key=f"hf_we_{i}")
                     with hc6:
                         if has_hist_data:
-                            if st.button(f"📊 自动计算（参考去年同期均值）", key=f"hf_auto_{i}"):
+                            _is_summer_hf = hf_list[i]['start'].month == 7
+                            _btn_label = "📊 自动计算（去年暑假/5月普通周末均值变化率推算）" if _is_summer_hf else "📊 自动计算（参考去年同期均值）"
+                            if st.button(_btn_label, key=f"hf_auto_{i}"):
                                 wd_auto, we_auto, n = _auto_calc_hf_yoy(
                                     hf_list[i]['start'], hf_list[i]['end'])
                                 if wd_auto is not None:
@@ -1925,7 +2250,7 @@ def _render_short_term_forecast():
                                 else:
                                     st.warning("历史数据中未找到去年同期数据，请先加载")
                         else:
-                            st.caption("先加载去年同期数据，再自动计算")
+                            st.caption("去年同期数据加载中，请稍候后重试")
 
                     if f'hf_auto_result_{i}' in st.session_state:
                         wd_r, we_r, n_r = st.session_state[f'hf_auto_result_{i}']
@@ -2172,7 +2497,7 @@ def _render_short_term_forecast():
                         else:
                             st.info("点击「计算去年YoY曲线」预览去年趋势并应用到今年预估")
                     else:
-                        st.warning("请先点击上方「加载去年同期数据」")
+                        st.warning("去年同期数据加载失败，请检查网络后刷新页面")
 
         # 新增自定义假期
         with st.expander("➕ 添加自定义假期", expanded=False):
@@ -2243,9 +2568,24 @@ def _render_short_term_forecast():
     ref_min_s = ref_min.strftime('%Y%m%d')
     ref_max_s = ref_max.strftime('%Y%m%d')
 
+    sql_26 = build_daily_dau_sql(hist_start_s, hist_end_s)
+    sql_25 = build_daily_dau_sql(ref_min_s, ref_max_s)
+
+    # 预取 key：由参数唯一确定
+    prefetch_key = (hist_start_s, hist_end_s, ref_min_s, ref_max_s)
+
+    # 日期确定后立即触发后台预取（已在跑或已完成则跳过）
     if not has_data or params_changed:
+        trigger_prefetch(prefetch_key, sql_26, sql_25)
+
+    if not has_data or params_changed:
+        prefetch_result = get_prefetch_result(prefetch_key)
+        if prefetch_result == 'running':
+            st.info("⏳ 后台数据预取中，点击「运行预估」时将直接使用结果...")
+        elif prefetch_result and prefetch_result[0] == 'done':
+            st.info("✅ 数据已预取完成，点击「运行预估」即可秒出结果")
+
         if st.button("🚀 运行预估", type="primary", key="btn_fc_daily"):
-            # 立即保存参数，防止中途切换后丢失
             st.session_state['fc_saved_params'] = {
                 'hist_start': hist_start, 'hist_end': hist_end,
                 'fc_start': fc_start, 'fc_end': fc_end, 'ref_days': ref_days,
@@ -2254,26 +2594,49 @@ def _render_short_term_forecast():
             st.session_state.pop('fc_wd_slope', None)
             st.session_state.pop('fc_we_slope', None)
             status = st.empty()
-            sql_26 = build_daily_dau_sql(hist_start_s, hist_end_s)
-            sql_25 = build_daily_dau_sql(ref_min_s, ref_max_s)
+
             with st.expander(f"查看SQL - {sy}年历史", expanded=False):
                 st.code(sql_26, language="sql")
             with st.expander(f"查看SQL - {ry}年参考", expanded=False):
                 st.code(sql_25, language="sql")
-            try:
-                status.warning("⏳ SQL执行中，请勿切换页面，否则需重新运行...")
-                df_26 = execute_sql(sql_26, status)
-                df_26['dau'] = pd.to_numeric(df_26['dau'], errors='coerce').fillna(0)
 
-                status.warning("⏳ SQL执行中（2/2），请勿切换页面...")
-                df_25 = execute_sql(sql_25, status)
-                df_25['dau'] = pd.to_numeric(df_25['dau'], errors='coerce').fillna(0)
+            try:
+                prefetch_result = get_prefetch_result(prefetch_key)
+
+                if prefetch_result and prefetch_result[0] == 'done':
+                    # 预取已完成，直接用
+                    _, df_26, df_25 = prefetch_result
+                    status.success("✅ 数据获取完成（已预取）")
+                elif prefetch_result == 'running':
+                    # 预取还在跑，等待完成
+                    status.info("⏳ 数据预取中，等待完成...")
+                    while True:
+                        time.sleep(1)
+                        r = get_prefetch_result(prefetch_key)
+                        if r and r[0] == 'done':
+                            _, df_26, df_25 = r
+                            status.success("✅ 数据获取完成（预取等待）")
+                            break
+                        elif r and r[0] == 'error':
+                            raise RuntimeError(r[1])
+                        elapsed = int(time.time())
+                        pct = min(int((time.time() % 60) / 30 * 100), 95)
+                        status.info(f"⏳ 预取中，请稍候...")
+                else:
+                    # 预取失败或未启动，同步跑
+                    df_26 = execute_sql(sql_26, status,
+                                        outer_placeholder=status,
+                                        step_label=f"（1/2）{sy}年历史数据")
+                    df_26['dau'] = pd.to_numeric(df_26['dau'], errors='coerce').fillna(0)
+                    df_25 = execute_sql(sql_25, status,
+                                        outer_placeholder=status,
+                                        step_label=f"（2/2）{ry}年参考数据")
+                    df_25['dau'] = pd.to_numeric(df_25['dau'], errors='coerce').fillna(0)
+                    status.success("✅ 数据获取完成")
 
                 st.session_state['fc_data_26'] = df_26
                 st.session_state['fc_data_25'] = df_25
                 st.session_state['fc_cached_params'] = current_params
-
-                status.success("✅ 数据获取完成")
                 has_data = True
             except Exception as e:
                 st.error(f"查询失败: {e}")
@@ -2466,92 +2829,13 @@ def _render_short_term_forecast():
                        file_name="DAU预估_AI.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        key="btn_export_forecast")
 
-    # ── 人工预估结果 ──
-    st.markdown("---")
-
-    mc1, mc2 = st.columns(2)
-    with mc1:
-        manual_wd_yoy = st.number_input("周中YoY%", value=round(weekday_yoy, 1), step=0.5, format="%.1f", key="manual_wd_yoy")
-    with mc2:
-        manual_we_yoy = st.number_input("周末YoY%", value=round(weekend_yoy, 1), step=0.5, format="%.1f", key="manual_we_yoy")
-
-    manual_result_df, _, _ = compute_daily_forecast(
-        df_26, df_25, align_map, forecast_dates, ref_days,
-        yoy_overrides=st.session_state.get('fc_yoy_overrides'),
-        manual_weekday_yoy=manual_wd_yoy, manual_weekend_yoy=manual_we_yoy,
-        weekday_slope=wd_slope, weekend_slope=we_slope,
-        src_year=src_year,
-        holiday_factors=st.session_state.get('fc_holiday_factors'),
-        yoy_curve_map=st.session_state.get('hf_yoy_curves'),
-        ref_date_start=ref_yoy_start, ref_date_end=ref_yoy_end)
-    manual_result_df[col_ref_week_date] = manual_result_df['日期'].map(week_align_map)
-    manual_result_df[col_ref_week_dau] = manual_result_df[col_ref_week_date].map(
-        lambda d: dau_25_lookup.get(d, 0) if d else 0)
-
-    st.markdown("#### 人工预估结果")
-    with st.expander("点击展开人工预估", expanded=False):
-        m_hist = manual_result_df[manual_result_df['数据类型'] == '实际'].copy()
-        m_fc = manual_result_df[manual_result_df['数据类型'].isin(['预估', '预估(调整)'])].copy().sort_values('日期')
-        m_fc_adj = manual_result_df[manual_result_df['数据类型'] == '预估(调整)'].copy()
-
-        fig_m = go.Figure()
-        fig_m.add_trace(go.Scatter(
-            x=m_hist['日期'], y=(m_hist[col_src_dau] / 1e4).round(0),
-            mode='lines', name=f'{sy}年实际', line=dict(width=2, color='#1f77b4'),
-            hovertemplate='%{x}<br>' + f'{sy}年实际: ' + dau_hover + '<extra></extra>'))
-        if not m_fc.empty:
-            fig_m.add_trace(go.Scatter(
-                x=m_fc['日期'], y=(m_fc[col_src_dau] / 1e4).round(0),
-                mode='lines', name=f'{sy}年预估(人工)', line=dict(width=2, dash='dash', color='#2ca02c'),
-                hovertemplate='%{x}<br>' + f'{sy}年预估(人工): ' + dau_hover + '<extra></extra>'))
-        if not m_fc_adj.empty:
-            fig_m.add_trace(go.Scatter(
-                x=m_fc_adj['日期'], y=(m_fc_adj[col_src_dau] / 1e4).round(0),
-                mode='markers', name='YoY调整点',
-                marker=dict(size=8, symbol='diamond', color='orange'),
-                hovertemplate='%{x}<br>预估(调整): ' + dau_hover + '<extra></extra>'))
-        fig_m.add_trace(go.Scatter(
-            x=manual_result_df['日期'], y=(manual_result_df[col_ref_dau] / 1e4).round(0),
-            mode='lines', name=f'{ry}年参考日期', line=dict(width=1, dash='dot', color='gray'),
-            hovertemplate='%{x}<br>' + f'{ry}年参考日期: ' + dau_hover + '<extra></extra>'))
-        fig_m.add_trace(go.Scatter(
-            x=manual_result_df['日期'], y=(manual_result_df[col_ref_week_dau] / 1e4).round(0),
-            mode='lines', name=f'{ry}年周对齐', line=dict(width=1, dash='dashdot', color='#ff7f0e'),
-            hovertemplate='%{x}<br>' + f'{ry}年周对齐: ' + dau_hover + '<extra></extra>'))
-        fig_m.update_layout(title="每日DAU趋势与预估（人工）", xaxis_title="日期", yaxis_title="DAU(万)",
-                            height=450, legend=dict(orientation="h", y=-0.12))
-        st.plotly_chart(fig_m, use_container_width=True)
-
-        with st.expander("人工预测明细表", expanded=False):
-            m_show = manual_result_df[['日期', col_src_dau, '数据类型', col_ref_date, col_ref_dau, 'YoY%']].copy()
-            m_show.insert(1, col_src_week, m_show['日期'].apply(_weekday_label))
-            m_show.insert(m_show.columns.get_loc(col_ref_date) + 1, col_ref_week,
-                          m_show[col_ref_date].apply(_weekday_label))
-            m_show[col_src_dau] = (m_show[col_src_dau] / 1e4).round(1)
-            m_show[col_ref_dau] = (m_show[col_ref_dau] / 1e4).round(1)
-            m_show['YoY%'] = m_show['YoY%'].round(1)
-            m_show.columns = disp_cols
-            st.dataframe(m_show, use_container_width=True, height=400)
-
-        m_export = manual_result_df[['日期', col_src_dau, col_ref_date, col_ref_dau, 'YoY%']].copy()
-        m_export.columns = [f'{sy}年日期', f'{sy}年DAU', f'同比{ry}年参考日期', f'{ry}年参考DAU', 'YoY%']
-        m_export[f'{sy}年日期'] = m_export[f'{sy}年日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
-        m_export[f'同比{ry}年参考日期'] = m_export[f'同比{ry}年参考日期'].apply(lambda d: d.strftime('%Y-%m-%d') if d else '')
-        m_export['YoY%'] = m_export['YoY%'].round(2)
-
-        m_buffer = io.BytesIO()
-        m_export.to_excel(m_buffer, index=False, engine='openpyxl')
-        st.download_button("📥 导出Excel（人工预估）", data=m_buffer.getvalue(),
-                           file_name="DAU预估_人工.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           key="btn_export_manual")
-
     # ── 预估探讨 ──
     st.markdown("---")
     st.subheader("💬 预估探讨")
-    _render_forecast_chat(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
+    _render_forecast_chat(result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
 
 
-def _format_forecast_for_llm(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
+def _format_forecast_for_llm(result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
     """将预估数据格式化为LLM可读的文本摘要"""
     sy = src_year % 100
     ry = (src_year - 1) % 100
@@ -2563,8 +2847,8 @@ def _format_forecast_for_llm(result_df, manual_result_df, src_year, fc_start, fc
     lines.append(f"AI预估YoY基准: 周中 {weekday_yoy:+.1f}%, 周末 {weekend_yoy:+.1f}%")
     lines.append("")
 
-    # 按月汇总 AI预估
-    ai_fc = result_df[result_df['数据类型'].isin(['预估', '预估(调整)'])].copy()
+    # 按月汇总 AI预估（含所有预估类型：预估/预估(调整)/预估(暑假)等）
+    ai_fc = result_df[result_df['数据类型'] != '实际'].copy()
     if not ai_fc.empty:
         ai_fc['月份'] = ai_fc['日期'].apply(lambda d: f"{d.year}年{d.month}月")
         monthly_ai = ai_fc.groupby('月份').agg(
@@ -2577,24 +2861,90 @@ def _format_forecast_for_llm(result_df, manual_result_df, src_year, fc_start, fc
             lines.append(f"- {r['月份']}: 日均DAU {r['日均DAU']/1e4:.1f}万, YoY {r['平均YoY']:+.1f}%, 预估天数{r['天数']}天")
         lines.append("")
 
-    # 按月汇总 人工预估
-    col_src_m = f'{sy}年DAU'
-    man_fc = manual_result_df[manual_result_df['数据类型'].isin(['预估', '预估(调整)'])].copy()
-    if not man_fc.empty:
-        man_fc['月份'] = man_fc['日期'].apply(lambda d: f"{d.year}年{d.month}月")
-        monthly_man = man_fc.groupby('月份').agg(
-            日均DAU=(col_src_m, 'mean'),
-            平均YoY=('YoY%', 'mean')
-        ).reset_index()
-        lines.append("### 人工预估 — 月度汇总（日均DAU，万）")
-        for _, r in monthly_man.iterrows():
-            lines.append(f"- {r['月份']}: 日均DAU {r['日均DAU']/1e4:.1f}万, YoY {r['平均YoY']:+.1f}%")
+    # 暑假预估专项（7~8月汇总）
+    summer_fc = ai_fc[ai_fc['日期'].apply(lambda d: d.month in (7, 8))] if not ai_fc.empty else None
+    if summer_fc is not None and not summer_fc.empty:
+        summer_we_avg = summer_fc[summer_fc['日期'].apply(
+            lambda d: d.weekday() >= 5)][col_src].mean()
+        summer_wd_avg = summer_fc[summer_fc['日期'].apply(
+            lambda d: d.weekday() < 5)][col_src].mean()
+        lines.append("### 暑假预估均值（7~8月）")
+        lines.append(f"- 整体日均DAU: {summer_fc[col_src].mean()/1e4:.1f}万")
+        if not pd.isna(summer_wd_avg):
+            lines.append(f"- 工作日日均DAU: {summer_wd_avg/1e4:.1f}万")
+        if not pd.isna(summer_we_avg):
+            lines.append(f"- 周末日均DAU: {summer_we_avg/1e4:.1f}万")
+        summer_yoy = summer_fc['YoY%'].mean()
+        if not pd.isna(summer_yoy):
+            lines.append(f"- 暑假平均YoY: {summer_yoy:+.1f}%")
         lines.append("")
 
-    # 历史最近14天实际
-    hist = result_df[result_df['数据类型'] == '实际'].tail(14).copy()
+    # 5月普通周末/工作日均值（今年 vs 去年，用于暑假因子参考）
+    from calendar_config import _is_weekend, _get_holiday_info, _is_transfer_work
+    def _may_normal_days(df_src, year, weekend):
+        """从df_src中取5月普通周末或工作日DAU均值"""
+        days = []
+        d = date(year, 5, 1)
+        while d <= date(year, 5, 31):
+            is_we = _is_weekend(d) and not _get_holiday_info(d, year) and not _is_transfer_work(d, year)
+            is_wd = not _is_weekend(d) and not _get_holiday_info(d, year) and not _is_transfer_work(d, year)
+            if (weekend and is_we) or (not weekend and is_wd):
+                days.append(d)
+            d += timedelta(days=1)
+        if df_src is None or df_src.empty:
+            return None
+        dau_map = {}
+        for _, row in df_src.iterrows():
+            raw = row['log_date']
+            if isinstance(raw, str):
+                dk = datetime.strptime(raw, '%Y%m%d').date()
+            else:
+                dk = raw
+            dau_map[dk] = float(row['dau'])
+        vals = [dau_map[d] for d in days if d in dau_map]
+        return sum(vals) / len(vals) if vals else None
+
+    df_cur_hf  = st.session_state.get('hf_data_cur')
+    df_ly_hf   = st.session_state.get('hf_data_ly')
+    cur_may_we = _may_normal_days(df_cur_hf,  src_year,   weekend=True)
+    cur_may_wd = _may_normal_days(df_cur_hf,  src_year,   weekend=False)
+    ly_may_we  = _may_normal_days(df_ly_hf,   src_year-1, weekend=True)
+    ly_may_wd  = _may_normal_days(df_ly_hf,   src_year-1, weekend=False)
+    ly_summer_we = ly_summer_wd = None
+    if df_ly_hf is not None and not df_ly_hf.empty:
+        dau_ly_map = {}
+        for _, row in df_ly_hf.iterrows():
+            raw = row['log_date']
+            dk = datetime.strptime(raw, '%Y%m%d').date() if isinstance(raw, str) else raw
+            dau_ly_map[dk] = float(row['dau'])
+        we_vals, wd_vals = [], []
+        d = date(src_year - 1, 7, 1)
+        while d <= date(src_year - 1, 8, 31):
+            if d in dau_ly_map:
+                if _is_weekend(d) or bool(_get_holiday_info(d, src_year - 1)):
+                    we_vals.append(dau_ly_map[d])
+                else:
+                    wd_vals.append(dau_ly_map[d])
+            d += timedelta(days=1)
+        ly_summer_we = sum(we_vals) / len(we_vals) if we_vals else None
+        ly_summer_wd = sum(wd_vals) / len(wd_vals) if wd_vals else None
+
+    may_lines = []
+    if cur_may_we: may_lines.append(f"今年({src_year})5月普通周末均值: {cur_may_we/1e4:.1f}万")
+    if cur_may_wd: may_lines.append(f"今年({src_year})5月普通工作日均值: {cur_may_wd/1e4:.1f}万")
+    if ly_may_we:  may_lines.append(f"去年({src_year-1})5月普通周末均值: {ly_may_we/1e4:.1f}万")
+    if ly_may_wd:  may_lines.append(f"去年({src_year-1})5月普通工作日均值: {ly_may_wd/1e4:.1f}万")
+    if ly_summer_we: may_lines.append(f"去年({src_year-1})暑假周末均值: {ly_summer_we/1e4:.1f}万")
+    if ly_summer_wd: may_lines.append(f"去年({src_year-1})暑假工作日均值: {ly_summer_wd/1e4:.1f}万")
+    if may_lines:
+        lines.append("### 5月基准 & 去年暑假均值（暑假因子自动计算参考）")
+        lines.extend([f"- {l}" for l in may_lines])
+        lines.append("")
+
+    # 历史全量实际数据
+    hist = result_df[result_df['数据类型'] == '实际'].copy()
     if not hist.empty:
-        lines.append(f"### 最近历史实际（近14天）")
+        lines.append(f"### 历史实际数据（全量）")
         for _, r in hist.iterrows():
             lines.append(f"- {r['日期']}: DAU {r[col_src]/1e4:.1f}万, YoY {r['YoY%']:+.1f}%")
         lines.append("")
@@ -2602,9 +2952,9 @@ def _format_forecast_for_llm(result_df, manual_result_df, src_year, fc_start, fc
     return '\n'.join(lines)
 
 
-def build_forecast_system_prompt(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
+def build_forecast_system_prompt(result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
     data_summary = _format_forecast_for_llm(
-        result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
+        result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
     sy = src_year % 100
     ry = (src_year - 1) % 100
 
@@ -2618,13 +2968,13 @@ def build_forecast_system_prompt(result_df, manual_result_df, src_year, fc_start
 
 ## 回答要求
 1. 必须引用具体数字（如"预估6月日均DAU约1200万，YoY +25%"），不要给模糊答案
-2. AI预估和人工预估结果如有差异，指出差异并说明原因
-3. 结合季节性规律（暑假/节假日/月末等）解释预估逻辑
+2. 结合季节性规律（暑假/节假日/月末等）解释预估逻辑
 4. 如果问题超出当前预估区间，坦诚告知
-5. 简洁有力，用要点形式组织，避免空泛"""
+5. 简洁有力，用要点形式组织，避免空泛
+6. 被问到某段时间的日均值时，直接从上方数据中找对应日期的DAU值进行算术平均，得出结果后直接报数字。不要描述计算方法，不要解释数据来源，不要提"系统基准值"、"官方基准"等说法。"""
 
 
-def _render_forecast_chat(result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
+def _render_forecast_chat(result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy):
     """预估探讨对话框"""
     st.caption("基于当前预估数据，追问预估结果、探讨假设场景")
 
@@ -2641,7 +2991,7 @@ def _render_forecast_chat(result_df, manual_result_df, src_year, fc_start, fc_en
             st.markdown(prompt)
 
         sys_prompt = build_forecast_system_prompt(
-            result_df, manual_result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
+            result_df, src_year, fc_start, fc_end, weekday_yoy, weekend_yoy)
         chat_hist = [{"role": m["role"], "content": m["content"]}
                      for m in st.session_state['fc_chat_history'][:-1]]
 
