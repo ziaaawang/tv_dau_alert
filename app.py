@@ -1993,20 +1993,17 @@ def _render_short_term_forecast():
                 sql_lyy = build_daily_dau_sql(hf_lyy_min, hf_lyy_max)
                 sql_cur = build_daily_dau_sql(hf_cur_min, hf_cur_max)
 
-                _hf_status.info("正在加载去年同期数据...")
-                df_ly  = execute_sql(sql_ly, _hf_status,
+                df_ly  = execute_sql(sql_ly, None,
                                      outer_placeholder=_hf_outer_status,
                                      step_label="（1/3）去年同期")
                 df_ly['dau'] = pd.to_numeric(df_ly['dau'], errors='coerce').fillna(0)
 
-                _hf_status.info("正在加载前年同期数据...")
-                df_lyy = execute_sql(sql_lyy, _hf_status,
+                df_lyy = execute_sql(sql_lyy, None,
                                      outer_placeholder=_hf_outer_status,
                                      step_label="（2/3）前年同期")
                 df_lyy['dau'] = pd.to_numeric(df_lyy['dau'], errors='coerce').fillna(0)
 
-                _hf_status.info("正在加载今年同期数据...")
-                df_cur = execute_sql(sql_cur, _hf_status,
+                df_cur = execute_sql(sql_cur, None,
                                      outer_placeholder=_hf_outer_status,
                                      step_label="（3/3）今年同期")
                 df_cur['dau'] = pd.to_numeric(df_cur['dau'], errors='coerce').fillna(0)
